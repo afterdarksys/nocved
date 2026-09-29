@@ -1,0 +1,166 @@
+---
+# nocved.yml: install (or remove) the nocved sensor, one host at a time.
+# SKELETON: not yet run against any host. Mirrors host-inventory.yml.
+#
+#   check first:  ansible-playbook -i hosts.ini nocved.yml --check --diff --limit canary
+#   apply:        ansible-playbook -i hosts.ini nocved.yml --limit mutable
+#   remove:       ansible-playbook -i hosts.ini nocved.yml --limit HOST -e nocved_state=absent
+#
+# Frozen/lockdown hosts (apps, apps2, stack, ns*, relay-*) go through a
+# vpscfgfarm break-glass runbook, not this playbook directly.
+#
+# Threats: the per-host key is a bearer + MAC credential. It is minted on the
+# store host by `nocve-store keys mint` (delegate_to), held only in a
+# registered variable with no_log, and written to the host by copy with
+# no_log and diff disabled; it never appears on argv of a shell on the fleet
+# host, in task output, or in a controller file. A key is minted only when the
+# host has none. Does NOT protect against root on the store host or on the
+# fleet host, which can read the key by design.
+
+- name: nocved sensor
+  hosts: all
+  serial: 1
+  any_errors_fatal: false
+  gather_facts: true
+  vars:
+    nocved_state: present
+    nocved_url: https://nocve.afterdarksys.com
+    nocved_store_host: CHANGE_ME_store_host   # Ryan: decide (DESIGN.md section 18)
+    nocved_store_db: /var/lib/nocve-store/nocve.db
+    nocved_repo: "{{ playbook_dir | dirname | dirname }}"
+    nocved_dist: "{{ nocved_repo }}/dist"
+    nocved_arch_map: { x86_64: amd64, aarch64: arm64 }
+    nocved_arch: "{{ nocved_arch_map[ansible_architecture] | default('unsupported') }}"
+    nocved_binary: "{{ nocved_dist }}/nocved-linux-{{ nocved_arch }}"
+    nocved_sums_sha256: >-
+      {{ lookup('ansible.builtin.file', nocved_dist ~ '/SHA256SUMS')
+         | regex_search('(?m)^([0-9a-f]{64})  nocved-linux-' ~ nocved_arch ~ '$', '\1')
+         | default([''], true) | first }}
+    nocved_report_name: "{{ nocved_host_override | default(ansible_hostname) }}"
+    nv_bin: /usr/local/bin/nocved
+    nv_dir: /etc/nocved
+    nv_cfg: /etc/nocved/config.json
+    nv_key: /etc/nocved/key
+    nv_unit: /etc/systemd/system/nocved.service
+
+  tasks:
+    - name: Check nocved_state
+      ansible.builtin.assert:
+        that: nocved_state in ['present', 'absent']
+        quiet: true
+      tags: [always]
+
+    - name: Install nocved
+      when: nocved_state == 'present'
+      block:
+        - name: Check the host is a supported Linux
+          ansible.builtin.assert:
+            that:
+              - ansible_system == 'Linux'
+              - nocved_arch != 'unsupported'
+              - nocved_store_host != 'CHANGE_ME_store_host'
+            fail_msg: "unsupported host or store host not chosen"
+            quiet: true
+
+        - name: Hash the binary on the controller
+          ansible.builtin.stat:
+            path: "{{ nocved_binary }}"
+            checksum_algorithm: sha256
+          delegate_to: localhost
+          become: false
+          register: nv_local_bin
+
+        - name: Check the binary matches dist/SHA256SUMS
+          ansible.builtin.assert:
+            that:
+              - nv_local_bin.stat.exists
+              - nocved_sums_sha256 | length == 64
+              - nv_local_bin.stat.checksum == nocved_sums_sha256
+            quiet: true
+
+        - name: Install the binary
+          ansible.builtin.copy:
+            src: "{{ nocved_binary }}"
+            dest: "{{ nv_bin }}"
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Create the config directory
+          ansible.builtin.file:
+            path: "{{ nv_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Write the config
+          ansible.builtin.copy:
+            dest: "{{ nv_cfg }}"
+            owner: root
+            group: root
+            mode: "0600"
+            content: "{{ {'store_url': nocved_url, 'key_file': nv_key, 'host': nocved_report_name} | to_json }}\n"
+
+        - name: Look for an existing key
+          ansible.builtin.stat:
+            path: "{{ nv_key }}"
+          register: nv_key_stat
+
+        - name: Mint a key on the store host (only when the host has none)
+          ansible.builtin.command:
+            argv: [/usr/local/bin/nocve-store, keys, mint, --host, "{{ nocved_report_name }}", --db, "{{ nocved_store_db }}"]
+          delegate_to: "{{ nocved_store_host }}"
+          register: nv_minted
+          no_log: true
+          changed_when: true
+          when: not nv_key_stat.stat.exists and not ansible_check_mode
+
+        - name: Write the key
+          ansible.builtin.copy:
+            dest: "{{ nv_key }}"
+            owner: root
+            group: root
+            mode: "0600"
+            content: "{{ nv_minted.stdout | trim }}\n"
+          no_log: true
+          diff: false
+          when: nv_minted is changed
+
+        - name: Check config, key and sources (sends nothing)
+          ansible.builtin.command:
+            argv: ["{{ nv_bin }}", check, --config, "{{ nv_cfg }}"]
+          changed_when: false
+          when: not ansible_check_mode
+
+        - name: Install the systemd unit
+          ansible.builtin.copy:
+            src: "{{ nocved_repo }}/deploy/nocved.service"
+            dest: "{{ nv_unit }}"
+            owner: root
+            group: root
+            mode: "0644"
+          register: nv_unit_copy
+
+        - name: Enable and start nocved
+          ansible.builtin.systemd:
+            name: nocved.service
+            enabled: true
+            state: "{{ 'restarted' if nv_unit_copy is changed else 'started' }}"
+            daemon_reload: "{{ nv_unit_copy is changed }}"
+
+    - name: Remove nocved (config, key and state are kept)
+      when: nocved_state == 'absent'
+      block:
+        - name: Stop and disable
+          ansible.builtin.systemd:
+            name: nocved.service
+            enabled: false
+            state: stopped
+          failed_when: false
+
+        - name: Remove binary and unit
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop: ["{{ nv_unit }}", "{{ nv_bin }}"]

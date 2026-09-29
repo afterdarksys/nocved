@@ -1,0 +1,15 @@
+{
+  "store_url": "https://nocve.afterdarksys.com",
+  "key_file": "/etc/nocved/key",
+  "state_dir": "/var/lib/nocved",
+  "heartbeat_secs": 30,
+  "spool_max_bytes": 8388608,
+  "sources": {
+    "process": { "enabled": true, "interval_secs": 2, "emit_exits": true, "cpu_threshold_pct": 80, "cpu_window_secs": 60 },
+    "net": { "enabled": true, "interval_secs": 5, "include_private": false },
+    "authlog": { "enabled": true, "interval_secs": 2, "paths": ["/var/log/auth.log", "/var/log/secure"], "silence_secs": 1800 },
+    "docker": { "enabled": true, "interval_secs": 5, "socket": "/var/run/docker.sock" },
+    "packages": { "enabled": true, "interval_secs": 5 },
+    "persistence": { "enabled": true, "interval_secs": 30 }
+  }
+}

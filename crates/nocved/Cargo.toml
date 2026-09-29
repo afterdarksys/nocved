@@ -1,0 +1,25 @@
+[package]
+name = "nocved"
+description = "nocved: continuous host behaviour sensor (push-only, chained, off-host)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+nocve-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+libc.workspace = true
+ureq.workspace = true
+
+[features]
+# Fixture builders (fake /proc, fake docker daemon) for integration tests.
+testutil = []
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

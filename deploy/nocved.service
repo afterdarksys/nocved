@@ -1,0 +1,52 @@
+# nocved: continuous host behaviour sensor (push-only; opens no port).
+# Root is required to read other users' /proc/<pid>/{exe,cwd,fd}, root-only
+# logs and authorized_keys; the capability bounding set limits root to
+# CAP_DAC_READ_SEARCH (read any file/dir) and CAP_SYS_PTRACE (ptrace-mode read
+# checks on /proc/<pid>/exe|cwd|fd). nocved never opens /proc/<pid>/mem or environ.
+[Unit]
+Description=nocved host behaviour sensor
+Documentation=file:///usr/local/share/doc/nocved/DESIGN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nocved run --config /etc/nocved/config.json
+Restart=always
+RestartSec=5
+User=root
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nocved
+StateDirectory=nocved
+StateDirectoryMode=0700
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=default
+ProcSubset=all
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io @module @obsolete
+UMask=0077
+MemoryMax=128M
+CPUQuota=5%
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
