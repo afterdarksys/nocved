@@ -178,6 +178,9 @@ pub struct Config {
     pub indicators_file: Option<PathBuf>,
     #[serde(default)]
     pub sources: Sources,
+    /// Optional read-only envelope feed for a local consumer (cveguard). Off by default.
+    #[serde(default)]
+    pub feed: crate::feed::FeedConfig,
 }
 fn d_key_file() -> PathBuf {
     PathBuf::from("/etc/nocved/key")
@@ -218,7 +221,7 @@ impl Config {
         if !self.state_dir.is_absolute() || !self.root.is_absolute() {
             return Err("state_dir and root must be absolute".into());
         }
-        Ok(())
+        self.feed.validate()
     }
 
     pub fn load_key(&self) -> Result<Token, String> {
@@ -256,13 +259,11 @@ impl Config {
 }
 
 pub fn validate_host(h: &str) -> Result<(), String> {
-    if h.is_empty()
-        || h.len() > 253
-        || !h
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
-    {
-        return Err("host must be 1-253 chars of [A-Za-z0-9._-]".into());
+    if !nocve_proto::valid_host(h) {
+        return Err(
+            "host must be a DNS name: 1-253 bytes, labels of 1-63 [A-Za-z0-9_-], no empty label"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -299,6 +300,13 @@ pub fn validate_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_rule_is_darksignals_dns_rule() {
+        assert!(validate_host("ns2.example").is_ok());
+        assert!(validate_host("a..b").is_err());
+        assert!(validate_host(&format!("{}.x", "a".repeat(64))).is_err());
+    }
 
     #[test]
     fn url_rules() {

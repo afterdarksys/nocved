@@ -1,13 +1,14 @@
 //! Main loop: poll due sources, spool chained events; a shipper thread pushes
 //! batches and heartbeats so a slow store never blocks polling.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nocve_proto::{Coverage, CoverageStatus, Event, EventData, Token};
 
 use crate::config::Config;
+use crate::notify::Notifier;
 use crate::ship::{ShipOutcome, Shipper};
 use crate::sources::{self, Ctx, Source, coverage};
 use crate::spool::Spool;
@@ -83,8 +84,30 @@ pub struct Sensor {
 impl Sensor {
     pub fn new(cfg: &Config, key: &Token) -> Result<Self, String> {
         let host = cfg.host_name()?;
-        let spool = Spool::open(&cfg.state_dir, &host, key.mac_key(), cfg.spool_max_bytes)?;
+        let mut spool = Spool::open(&cfg.state_dir, &host, key.mac_key(), cfg.spool_max_bytes)?;
         let mut disabled = Vec::new();
+        if cfg.feed.enabled {
+            // A feed problem must never stop the sensor: report it in coverage.
+            let opened = cfg
+                .feed
+                .group
+                .as_deref()
+                .map(|g| crate::feed::resolve_gid(&cfg.root, g))
+                .transpose()
+                .and_then(|gid| {
+                    if cfg.feed.dir.starts_with(&cfg.state_dir) {
+                        crate::feed::allow_traverse(&cfg.state_dir, gid)?;
+                    }
+                    crate::feed::Feed::open(&cfg.feed, gid)
+                });
+            match opened {
+                Ok(f) => spool.set_feed(f),
+                Err(e) => {
+                    eprintln!("nocved: feed disabled: {e}");
+                    disabled.push(coverage("feed", CoverageStatus::Failed, e));
+                }
+            }
+        }
         let s = &cfg.sources;
         for (name, on) in [
             ("process", s.process.enabled),
@@ -120,6 +143,7 @@ impl Sensor {
 
     /// Spools the `sensor.start` event (call once, before the first tick).
     pub fn start(&mut self, now_ms: i64) -> Result<(), String> {
+        let coverage = self.coverage();
         let mut sp = self.spool.lock().map_err(|_| "spool lock poisoned")?;
         let ev = Event::new(
             now_ms,
@@ -128,7 +152,7 @@ impl Sensor {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 boot_id: self.boot_id.clone(),
                 new_epoch: sp.new_epoch,
-                coverage: self.coverage(),
+                coverage,
             },
         );
         sp.push(&ev);
@@ -166,10 +190,15 @@ impl Sensor {
         self.tick(now_ms)
     }
 
+    /// Source health, disabled sources, and the feed when one is open.
+    /// Takes the spool lock: never call it while holding that lock.
     #[must_use]
     pub fn coverage(&self) -> Vec<Coverage> {
         let mut v: Vec<Coverage> = self.sources.iter().map(|(s, _)| s.health()).collect();
         v.extend(self.disabled.iter().cloned());
+        if let Some((long, burst)) = self.spool.lock().ok().and_then(|s| s.feed_skipped()) {
+            v.push(feed_coverage(long, burst));
+        }
         v
     }
 
@@ -180,6 +209,22 @@ impl Sensor {
             .min()
             .unwrap_or(i64::MAX)
     }
+}
+
+/// `feed: degraded` once any line was skipped, so the store and operators
+/// see that cveguard's view is incomplete.
+fn feed_coverage(long: u64, burst: u64) -> Coverage {
+    if long == 0 && burst == 0 {
+        return coverage("feed", CoverageStatus::Completed, "");
+    }
+    coverage(
+        "feed",
+        CoverageStatus::Degraded,
+        format!(
+            "skipped {long} line(s) over {} bytes, {burst} during a rotation hold",
+            crate::feed::MAX_FEED_LINE
+        ),
+    )
 }
 
 fn jitter_ms(max: u64) -> u64 {
@@ -212,6 +257,17 @@ pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
     let hb_ms = i64::try_from(cfg.heartbeat_secs).unwrap_or(30) * 1000;
     let boot_id = sensor.boot_id.clone();
     let cov2 = Arc::clone(&cov);
+    // Main-loop liveness for the heartbeat (0 = no tick yet). The heartbeat is
+    // sent by the shipper thread, so without this a frozen poll loop would look
+    // healthy at the store.
+    let last_tick = AtomicI64::new(0);
+    let notifier = Notifier::from_env();
+    if let Some(n) = &notifier
+        && let Err(e) = n.notify("READY=1")
+    {
+        eprintln!("nocved: sd_notify: {e}");
+    }
+    let mut last_watchdog = i64::MIN;
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let mut next_hb = 0i64;
@@ -220,7 +276,8 @@ pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
                 let now = now_ms();
                 if now >= next_hb {
                     let c = cov2.lock().map(|c| c.clone()).unwrap_or_default();
-                    match shipper.heartbeat(&spool, c, now, boot_id.clone()) {
+                    let tick = Some(last_tick.load(Ordering::Relaxed)).filter(|t| *t > 0);
+                    match shipper.heartbeat(&spool, c, now, boot_id.clone(), tick) {
                         Ok(200) => {}
                         Ok(st) => eprintln!("nocved: heartbeat status {st}"),
                         Err(e) => eprintln!("nocved: heartbeat: {e}"),
@@ -233,6 +290,11 @@ pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
                         continue;
                     }
                     ShipOutcome::Idle => std::thread::sleep(Duration::from_millis(500)),
+                    ShipOutcome::Split { status, keep } => {
+                        eprintln!(
+                            "nocved: store rejected a batch ({status}); resending in parts of {keep}"
+                        );
+                    }
                     ShipOutcome::Rejected { status, body } => {
                         eprintln!(
                             "nocved: store rejected batch ({status}): {}",
@@ -255,6 +317,16 @@ pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
             }
             if let Ok(mut c) = cov.lock() {
                 *c = sensor.coverage();
+            }
+            let done = now_ms();
+            last_tick.store(done, Ordering::Relaxed);
+            if let Some(n) = &notifier
+                && done.saturating_sub(last_watchdog) >= 5_000
+            {
+                last_watchdog = done;
+                if let Err(e) = n.notify("WATCHDOG=1") {
+                    eprintln!("nocved: sd_notify: {e}");
+                }
             }
             let wait = (sensor.next_due() - now_ms()).clamp(100, 1000);
             std::thread::sleep(Duration::from_millis(u64::try_from(wait).unwrap_or(1000)));

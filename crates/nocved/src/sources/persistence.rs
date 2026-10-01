@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use super::{Ctx, MAX_EVENTS_PER_POLL, Source, cap_events, coverage};
 use crate::config::SourceToggle;
-use crate::fsutil::open_nofollow;
+use crate::fsutil::open_regular_nofollow;
 
 pub const MAX_HASH_BYTES: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 8192;
@@ -54,7 +54,16 @@ const FILES: &[(&str, &str)] = &[
     ("/root/.bashrc", "shell_init"),
     ("/root/.profile", "shell_init"),
     ("/root/.bash_profile", "shell_init"),
+    // Kernel helpers run as root on a core dump, module autoload, or uevent.
+    ("/proc/sys/kernel/core_pattern", "kernel_hook"),
+    ("/proc/sys/kernel/modprobe", "kernel_hook"),
+    ("/sys/kernel/uevent_helper", "kernel_hook"),
 ];
+
+/// procfs/sysfs files do not update size or mtime on write: always re-hash.
+fn virtual_fs(shown: &str) -> bool {
+    shown.starts_with("/proc/") || shown.starts_with("/sys/")
+}
 
 const DIRS: &[(&str, &str)] = &[
     ("/etc/cron.d", "cron"),
@@ -101,7 +110,7 @@ const HISTORY_FILES: &[&str] = &[
 fn severity_for(category: &str) -> Severity {
     match category {
         "ld_preload" | "ssh_keys" | "sudo" | "accounts" | "sshd" | "pam" | "dbus" | "polkit"
-        | "udev" | "modprobe" => Severity::High,
+        | "udev" | "modprobe" | "kernel_hook" => Severity::High,
         _ => Severity::Medium,
     }
 }
@@ -204,10 +213,14 @@ impl PersistenceSource {
                 return;
             }
         };
-        let mut names: Vec<String> = rd
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        let (mut names, over) = bounded_names(
+            rd.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned()),
+            MAX_ENTRIES,
+        );
+        if over {
+            walk.hit_child_cap = true;
+        }
         names.sort();
         for n in names {
             if walk.hit_entry_cap {
@@ -265,9 +278,13 @@ impl PersistenceSource {
         } else {
             None
         };
-        let unchanged = prev.is_some_and(|p| {
-            p.size == m.size() && p.mtime == m.mtime() && p.ctime == m.ctime() && p.inode == m.ino()
-        });
+        let unchanged = !virtual_fs(shown)
+            && prev.is_some_and(|p| {
+                p.size == m.size()
+                    && p.mtime == m.mtime()
+                    && p.ctime == m.ctime()
+                    && p.inode == m.ino()
+            });
         let sha256 = if !ft.is_file() {
             None
         } else if unchanged {
@@ -334,8 +351,20 @@ impl PersistenceSource {
     }
 }
 
+/// At most `cap` names, pulling at most `cap + 1` from the directory: a
+/// directory with millions of entries is never read into memory just to be
+/// capped later. The flag says entries were left unread (partial coverage).
+fn bounded_names(names: impl Iterator<Item = String>, cap: usize) -> (Vec<String>, bool) {
+    let mut v: Vec<String> = names.take(cap + 1).collect();
+    let over = v.len() > cap;
+    v.truncate(cap);
+    (v, over)
+}
+
+/// SHA-256 of a regular file. The type is checked on the open fd (`lstat`
+/// said "file", but the path may have been swapped for a FIFO since).
 fn hash_file(path: &Path) -> Option<String> {
-    let f = open_nofollow(path).ok()?;
+    let (f, _) = open_regular_nofollow(path).ok()?;
     let mut h = Sha256::new();
     let mut buf = [0u8; 16 * 1024];
     let mut r = f.take(MAX_HASH_BYTES);
@@ -503,6 +532,7 @@ impl Source for PersistenceSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::Arc;
 
     fn w(root: &Path, p: &str, s: &str) {
@@ -671,6 +701,144 @@ mod tests {
             Severity::High
         )));
         assert_eq!(s.health().status, CoverageStatus::Completed);
+    }
+
+    /// H1: hashing a path that is (or became) a FIFO used to block forever.
+    #[test]
+    fn fifo_is_never_opened_for_hashing() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("fifo");
+        crate::testutil::mkfifo(&p).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = p.clone();
+        std::thread::spawn(move || tx.send(hash_file(&p2)).unwrap());
+        let got = rx.recv_timeout(std::time::Duration::from_secs(3));
+        let _unblock = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&p);
+        assert_eq!(got.expect("hash_file blocked on a FIFO"), None);
+    }
+
+    /// H1, reviewer probe: an unprivileged user flips ~/.ssh/authorized_keys
+    /// between a regular file and a FIFO; no poll may hang.
+    #[test]
+    fn fifo_swap_race_on_authorized_keys_never_blocks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_path_buf();
+        let ssh = root.join("home/mallory/.ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let target = ssh.join("authorized_keys");
+        std::fs::write(&target, b"ssh-ed25519 AAAA x\n").unwrap();
+        let mut s = src(&root);
+        let mut evs = Vec::new();
+        s.poll(0, &mut evs);
+        let stop = Arc::new(AtomicBool::new(false));
+        let st2 = Arc::clone(&stop);
+        let (t2, fifo, reg) = (target.clone(), ssh.join(".f"), ssh.join(".r"));
+        let flipper = std::thread::spawn(move || {
+            let mut i = 0u64;
+            while !st2.load(Ordering::Relaxed) {
+                i += 1;
+                std::fs::write(&reg, format!("k{i}\n")).unwrap();
+                let _ = std::fs::rename(&reg, &t2);
+                if crate::testutil::mkfifo(&fifo).is_ok() {
+                    let _ = std::fs::rename(&fifo, &t2);
+                }
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for n in 1..=300i64 {
+                let mut evs = Vec::new();
+                s.poll(n * 30_000, &mut evs);
+                if tx.send(n).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut last = 0;
+        while last < 300 {
+            match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+                Ok(n) => last = n,
+                Err(_) => break,
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().unwrap();
+        for _ in 0..50 {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&target);
+        }
+        assert_eq!(
+            last, 300,
+            "PersistenceSource::poll blocked after {last} polls"
+        );
+    }
+
+    /// M7: a directory over the entry cap is partial coverage, and the walk
+    /// does not read past the cap.
+    #[test]
+    fn huge_directory_is_capped_and_partial() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("etc/cron.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..=MAX_ENTRIES {
+            std::fs::write(dir.join(format!("j{i:05}")), "").unwrap();
+        }
+        let mut s = src(d.path());
+        let mut out = Vec::new();
+        s.poll(0, &mut out);
+        assert_eq!(
+            s.health().status,
+            CoverageStatus::Partial,
+            "{:?}",
+            s.health()
+        );
+        assert!(s.known.as_ref().unwrap().len() <= MAX_ENTRIES + FILES.len());
+    }
+
+    /// M7: the directory listing is bounded BEFORE it is collected.
+    #[test]
+    fn directory_listing_is_bounded_before_collect() {
+        let pulled = std::cell::Cell::new(0usize);
+        let names = (0..1_000_000).map(|i| {
+            pulled.set(pulled.get() + 1);
+            format!("n{i}")
+        });
+        let (v, over) = bounded_names(names, 10);
+        assert_eq!(v.len(), 10);
+        assert!(over);
+        assert_eq!(pulled.get(), 11, "never pulls past cap + 1");
+        let (v, over) = bounded_names((0..3).map(|i| i.to_string()), 10);
+        assert_eq!((v.len(), over), (3, false));
+    }
+
+    /// M8: kernel helper hooks are watched; procfs files are re-hashed even
+    /// though their size/mtime never change.
+    #[test]
+    fn core_pattern_change_is_high() {
+        let d = tempfile::tempdir().unwrap();
+        w(d.path(), "/proc/sys/kernel/core_pattern", "core\n");
+        w(d.path(), "/sys/kernel/uevent_helper", "\n");
+        let mut s = src(d.path());
+        let mut out = Vec::new();
+        s.poll(0, &mut out);
+        let p = d.path().join("proc/sys/kernel/core_pattern");
+        let before = std::fs::metadata(&p).unwrap();
+        // Same size, same mtime: only the content differs.
+        std::fs::write(&p, "|/tmp/x\n").unwrap();
+        let f = std::fs::File::options().write(true).open(&p).unwrap();
+        f.set_modified(before.modified().unwrap()).unwrap();
+        s.poll(30_000, &mut out);
+        let hit = out.iter().find(|e| {
+            matches!(&e.data, EventData::PersistenceChange { path, .. } if path == "/proc/sys/kernel/core_pattern")
+        });
+        let hit = hit.expect("core_pattern change");
+        assert_eq!(hit.max_severity(), Some(Severity::High));
     }
 
     #[test]

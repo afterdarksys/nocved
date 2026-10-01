@@ -35,4 +35,7 @@ expect_used = "deny"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# unwind, not abort: nocve-store wraps every request in catch_unwind so one
+# panicking handler cannot kill the collector (finding C1). nocved restores
+# abort-on-panic with a panic hook in its main().
+panic = "unwind"

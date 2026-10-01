@@ -84,3 +84,80 @@ pub fn cap_events(
         out.extend(evs);
     }
 }
+
+/// `log.tamper` events (rule `{prefix}.truncated|replaced|rewritten|deleted|symlink`)
+/// and `log.skipped` events for one tailer poll. Shared by every log source.
+pub fn tail_events(
+    source: &'static str,
+    prefix: &str,
+    now_ms: i64,
+    path: &str,
+    o: &tail::TailOutput,
+    evs: &mut Vec<Event>,
+) {
+    use nocve_proto::{Severity, Signal};
+    use tail::Anomaly;
+    for anomaly in &o.anomalies {
+        let (reason, detail) = match anomaly {
+            Anomaly::Truncated { from, to } => (
+                "truncated",
+                format!("{path} shrank from {from} to {to} bytes"),
+            ),
+            Anomaly::Replaced {
+                old_inode,
+                new_inode,
+                old_unlinked,
+            } => (
+                "replaced",
+                format!(
+                    "{path} replaced in place (inode {old_inode} -> {new_inode}, old unlinked: {old_unlinked}); typical of sed -i"
+                ),
+            ),
+            Anomaly::Rewritten { offset } => (
+                "rewritten",
+                format!(
+                    "{path}: bytes before offset {offset} changed in place (already-read lines edited)"
+                ),
+            ),
+            Anomaly::Deleted => ("deleted", format!("{path} was deleted")),
+            Anomaly::Symlink => ("symlink", format!("{path} is now a symlink (not followed)")),
+        };
+        evs.push(
+            Event::new(
+                now_ms,
+                source,
+                EventData::LogTamper {
+                    path: path.to_owned(),
+                    reason: reason.to_owned(),
+                    detail: detail.clone(),
+                },
+            )
+            .with_signals(vec![Signal::new(
+                &format!("{prefix}.{reason}"),
+                Severity::High,
+                detail,
+            )]),
+        );
+    }
+    for s in &o.skipped {
+        let detail = format!(
+            "{path}: {} bytes were lost before they could be read ({})",
+            s.bytes, s.reason
+        );
+        evs.push(
+            Event::new(
+                now_ms,
+                source,
+                EventData::LogSkipped {
+                    path: path.to_owned(),
+                    bytes: s.bytes,
+                    reason: s.reason.to_owned(),
+                },
+            )
+            .with_signals(vec![Signal::new("log.skipped", Severity::High, detail)]),
+        );
+    }
+}
+
+/// Coverage detail suffix for tail lag; lag over this many bytes is partial coverage.
+pub const LAG_PARTIAL_BYTES: u64 = 8 * 1024 * 1024;

@@ -20,6 +20,9 @@
 #   --key-stdin            read the host key (one line) from stdin
 #   --unit PATH            systemd unit to install (default: nocved.service next to this script)
 #   --no-start             install but do not enable/start the service
+#   --audit-rules PATH     auditd execve rule to install (default: audit/nocved.rules
+#                          next to this script; installed only if auditd is present)
+#   --no-audit-rules       do not install the auditd execve rule
 #   --uninstall [--purge]
 #
 # Threats: the binary runs as root; nothing is installed unless its SHA-256
@@ -39,7 +42,14 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 say() { echo "install.sh: $*"; }
 
 binary='' sha='' url='' host_override='' unit_src=$HERE/nocved.service
+audit_src=$HERE/audit/nocved.rules audit_rules=1
+AUDIT_DST=/etc/audit/rules.d/50-nocved.rules
 key_stdin=0 no_start=0 uninstall=0 purge=0
+
+# Restore terminal echo however we exit (the key prompt turns it off).
+restore_tty() { if [ -t 0 ]; then stty echo 2>/dev/null || true; fi; }
+trap restore_tty EXIT
+trap 'restore_tty; exit 130' INT TERM HUP
 
 need() { [ $# -ge 2 ] || die "$1 needs a value"; }
 while [ $# -gt 0 ]; do
@@ -49,12 +59,14 @@ while [ $# -gt 0 ]; do
     --url) need "$@"; url=$2; shift 2 ;;
     --host-override) need "$@"; host_override=$2; shift 2 ;;
     --unit) need "$@"; unit_src=$2; shift 2 ;;
+    --audit-rules) need "$@"; audit_src=$2; shift 2 ;;
+    --no-audit-rules) audit_rules=0; shift ;;
     --key-stdin) key_stdin=1; shift ;;
     --no-start) no_start=1; shift ;;
     --uninstall) uninstall=1; shift ;;
     --purge) purge=1; shift ;;
     --key|--key=*) die "the key is never passed as an argument; use --key-stdin" ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -75,7 +87,10 @@ if [ "$uninstall" -eq 1 ]; then
     rm -f "$CFG" "$KEY" "$ETC_DIR"/.config.json.new "$ETC_DIR"/.key.new
     if [ -d "$ETC_DIR" ]; then rmdir "$ETC_DIR" || die "$ETC_DIR not empty; left in place"; fi
     # Named files only: never a recursive delete.
-    rm -f "$STATE_DIR/state.json" "$STATE_DIR/spool.jsonl" "$STATE_DIR/rejected.jsonl"
+    rm -f "$STATE_DIR/state.json" "$STATE_DIR/spool.jsonl" "$STATE_DIR/rejected.jsonl" \
+      "$STATE_DIR/spool.rekeyed.jsonl" \
+      "$STATE_DIR/cveguard-feed/events.jsonl" "$STATE_DIR/cveguard-feed/events.jsonl.1"
+    if [ -d "$STATE_DIR/cveguard-feed" ]; then rmdir "$STATE_DIR/cveguard-feed" || true; fi
     if [ -d "$STATE_DIR" ]; then rmdir "$STATE_DIR" || say "$STATE_DIR not empty; left in place"; fi
     say "removed config, key and state (the store will see a new chain epoch on reinstall)"
   else
@@ -117,7 +132,14 @@ if [ -n "$binary" ]; then
   if [ -f "$BIN_DST" ] && [ "$(sha256_of "$BIN_DST")" = "$sha" ]; then
     say "binary unchanged ($BIN_DST)"
   else
+    rm -f "$BIN_DST.new"
     install -m 0755 -o root -g root "$binary" "$BIN_DST.new"
+    # Verify the copy that is about to become the binary, BEFORE it replaces
+    # the running one (the source could change between hash and copy).
+    if [ "$(sha256_of "$BIN_DST.new")" != "$sha" ]; then
+      rm -f "$BIN_DST.new"
+      die "sha256 mismatch for the copied binary; $BIN_DST left unchanged"
+    fi
     mv -f "$BIN_DST.new" "$BIN_DST"
     say "installed $BIN_DST"
   fi
@@ -176,6 +198,24 @@ chown root:root "$KEY"; chmod 0600 "$KEY"
 # check validates config/key permissions and polls every source once; sends nothing.
 "$BIN_DST" check --config "$CFG" || die "check failed; fix the errors above (nothing was sent)"
 say "check ok"
+
+# ---------------------------------------------------------------- auditd rule
+# Without an execve rule the auditd source sees no EXECVE records and reports
+# coverage partial. Installed only where auditd is present; never removed.
+if [ "$audit_rules" -eq 1 ] && [ -d /etc/audit/rules.d ]; then
+  [ -f "$audit_src" ] || die "audit rule not found: $audit_src (or pass --no-audit-rules)"
+  if [ -f "$AUDIT_DST" ] && cmp -s "$audit_src" "$AUDIT_DST"; then
+    say "audit rule unchanged ($AUDIT_DST)"
+  else
+    install -m 0640 -o root -g root "$audit_src" "$AUDIT_DST"
+    if command -v augenrules >/dev/null 2>&1; then
+      augenrules --load >/dev/null || say "WARNING: augenrules --load failed; auditd coverage will report partial"
+    fi
+    say "installed $AUDIT_DST"
+  fi
+elif [ "$audit_rules" -eq 1 ]; then
+  say "no /etc/audit/rules.d (auditd not installed); the auditd source will report unsupported"
+fi
 
 # ---------------------------------------------------------------- systemd
 install -d -m 0700 -o root -g root "$STATE_DIR"

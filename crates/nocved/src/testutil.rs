@@ -142,3 +142,20 @@ impl FakeProc {
         )
     }
 }
+
+/// Creates a FIFO at `p` with the system `mkfifo` (no `unsafe` in the crate).
+pub fn mkfifo(p: &Path) -> std::io::Result<()> {
+    let st = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(p)
+        .status()?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "mkfifo {}: {st}",
+            p.display()
+        )))
+    }
+}

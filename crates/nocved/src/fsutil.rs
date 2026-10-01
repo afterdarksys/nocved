@@ -6,12 +6,30 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-/// Opens read-only without following a final symlink.
+/// Opens read-only without following a final symlink. `O_NONBLOCK` makes
+/// `open(2)` of a FIFO return at once instead of blocking until a writer
+/// appears (an attacker swapping a watched path for a FIFO must not freeze the
+/// single polling thread). It has no effect on regular-file reads.
 pub fn open_nofollow(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
+}
+
+/// `open_nofollow`, then `fstat` on the open fd: anything but a regular file
+/// (FIFO, socket, device, directory) is refused before a single byte is read.
+/// The check is on the fd, so a swap between `lstat` and `open` cannot win.
+pub fn open_regular_nofollow(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
+    let f = open_nofollow(path)?;
+    let md = f.metadata()?;
+    if !md.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((f, md))
 }
 
 /// Reads at most `max` bytes. Returns an error if the file is larger (fail closed).
@@ -54,11 +72,7 @@ pub enum Secrecy {
 /// TOCTOU between check and read). Owner must be root or the current user.
 pub fn read_secure(path: &Path, max: usize, secrecy: Secrecy) -> Result<Vec<u8>, String> {
     let shown = path.display();
-    let f = open_nofollow(path).map_err(|e| format!("{shown}: {e}"))?;
-    let md = f.metadata().map_err(|e| format!("{shown}: {e}"))?;
-    if !md.file_type().is_file() {
-        return Err(format!("{shown}: not a regular file"));
-    }
+    let (f, md) = open_regular_nofollow(path).map_err(|e| format!("{shown}: {e}"))?;
     let me = current_uid();
     if md.uid() != 0 && Some(md.uid()) != me {
         return Err(format!("{shown}: owned by uid {}, want root", md.uid()));
@@ -150,6 +164,29 @@ mod tests {
         assert!(read_secure(&link, 100, Secrecy::Key).is_err());
         assert!(read_secure(&key, 1, Secrecy::Key).is_err());
         assert!(read_secure(d.path(), 100, Secrecy::Config).is_err());
+        Ok(())
+    }
+
+    /// H1: a FIFO at a read path used to block `open(2)` forever.
+    #[test]
+    fn fifo_is_refused_without_blocking() -> Result<(), Box<dyn std::error::Error>> {
+        let d = tempfile::tempdir()?;
+        let p = d.path().join("fifo");
+        crate::testutil::mkfifo(&p)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = p.clone();
+        std::thread::spawn(move || {
+            let r = open_regular_nofollow(&p2).map(|_| ());
+            let _sent = tx.send(r.map_err(|e| e.kind()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(3));
+        // Unblock a stuck open (pre-fix behaviour) so the test process can exit.
+        let _unblock = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&p);
+        assert_eq!(got?, Err(io::ErrorKind::InvalidInput));
+        assert!(read_secure(&p, 100, Secrecy::Config).is_err());
         Ok(())
     }
 

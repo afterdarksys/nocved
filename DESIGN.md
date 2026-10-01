@@ -1,6 +1,7 @@
 # nocved design
 
 Status: MVP, not deployed. Author: agent build for Ryan, 2026-09-29.
+Security review fixes: 2026-10-01 (section 22 lists what changed and what remains).
 Motivating incident: `.planning/incidents/2026-09-29-root-password-proxyware/FINDINGS.md`
 (afterdarksys.com repo). Every behaviour in that incident must reach the
 central store within seconds, before the attacker can hide it.
@@ -52,6 +53,24 @@ What it protects against:
 - Replay, reordering, dropping, or rewriting of events in transit or in the
   local spool (section 6).
 - A sensor that quietly stops: heartbeats and `sensor.silent`.
+- A sensor whose poll loop is frozen while its shipper still heartbeats (a
+  watched path swapped for a FIFO, a hung read): every open of a watched file
+  is `O_NONBLOCK` + `fstat` on the fd + regular files only; the heartbeat
+  carries `last_tick_ms` and the store raises `sensor.stalled`; systemd's
+  watchdog (`WatchdogSec=60`, fed from the poll loop) restarts the sensor.
+- `logger -t 'sshd[PID]'` injection into auth.log: a line is verified only if
+  `/proc/PID/exe` is a live sshd binary. Unverified lines are shipped with
+  `unverified: true`, never feed `fleet.password_sweep`, and an unverified
+  failure never suppresses `ssh.password_first_try`. An attacker who names
+  the pid of a real, live sshd still passes this check.
+- One host (or one stolen key) filling the store or drowning the fleet's
+  alerts: per-host daily byte/row/alert quotas (429 + one
+  `host.quota_exceeded`), and a per (host, rule) alert rate limit (one
+  `alert.rate_limited` per window; events are still stored).
+- A request that crashes the store: unauthenticated input never reaches path
+  parsing (admin auth runs first), and every request runs under
+  `catch_unwind` with a poison-tolerant DB mutex (release profile
+  `panic = "unwind"`).
 
 What it does NOT protect against (read this before trusting it):
 
@@ -65,7 +84,17 @@ What it does NOT protect against (read this before trusting it):
   counter, and it is still bounded by the shared kernel.
 - **Short-lived processes** (< poll interval, default 2 s) are missed by
   `/proc` polling. The auditd execve tail records them when `audit.log` is
-  being written (section 11). An eBPF source remains the later path on 6.1.
+  being written AND an execve audit rule is loaded (`deploy/audit/nocved.rules`,
+  installed by `install.sh` and the playbook); with no `EXECVE` record for
+  5 minutes the auditd source reports coverage `partial`. An exec with more
+  than 128 arguments or an argument over 4 KiB is emitted truncated
+  (`truncated: true`), never dropped. An eBPF source remains the later path
+  on 6.1 (section 11).
+- **A root attacker with the key between heartbeats.** Heartbeats attest the
+  chain head; truncation behind an attested head raises `chain.rollback` and
+  re-chaining an attested seq raises `chain.rewrite`. Events chained and
+  dropped before any heartbeat attested them are not detected (heartbeat
+  interval: 30 s).
 - **Store compromise.** The store holds the derived MAC key for each host
   (section 7). Someone who reads the store DB can forge MACs for that host's
   chain; they still cannot push without the bearer secret, whose preimage the
@@ -139,11 +168,19 @@ every parser is tested from fixtures on any OS.
 | `authlog` | 2 s | `/var/log/auth.log`, `/var/log/secure` | `ssh.auth`, `ssh.session`, `log.tamper` |
 | `docker` | 5 s | `/var/run/docker.sock`: `GET /events?since&until` (finite window), `/containers/json`, `/containers/{id}/json` | `container.seen`, `container.create`, `container.start` |
 | `packages` | 5 s | `/var/log/dpkg.log`, `/var/log/apt/history.log` | `package.change`, `package.transaction`, `log.tamper` |
-| `persistence` | 30 s | stat + SHA-256 (never file bytes) of cron, anacrontab, at spools (`/var/spool/at`, `/var/spool/cron/atjobs`), systemd unit dirs including `/etc/systemd/user`, `/var/lib/systemd/linger`, and `{home}/.config/systemd/user`, `ld.so.preload` and `ld.so.conf.d`, `authorized_keys`, sshd, account files, sudoers, PAM, shell init (`profile`, `bash.bashrc`, zsh env/rc, `profile.d`), D-Bus system policy, polkit, udev rules, tmpfiles, modprobe; lstat of shell history. An entry cap, a nested-directory cap, or an unreadable directory is partial coverage. Vendor unit trees and `/run` stay with aftercve's one-shot snapshot. | `persistence.baseline`, `persistence.change`, `history.devnull` |
-| `auditd` | 2 s | `/var/log/audit/audit.log` | `audit.exec`, `log.tamper` |
+| `persistence` | 30 s | stat + SHA-256 (never file bytes) of `core_pattern`, `/proc/sys/kernel/modprobe` and `/sys/kernel/uevent_helper` (re-hashed every poll: procfs/sysfs do not update size or mtime), cron, anacrontab, at spools (`/var/spool/at`, `/var/spool/cron/atjobs`), systemd unit dirs including `/etc/systemd/user`, `/var/lib/systemd/linger`, and `{home}/.config/systemd/user`, `ld.so.preload` and `ld.so.conf.d`, `authorized_keys`, sshd, account files, sudoers, PAM, shell init (`profile`, `bash.bashrc`, zsh env/rc, `profile.d`), D-Bus system policy, polkit, udev rules, tmpfiles, modprobe; lstat of shell history. An entry cap, a nested-directory cap, or an unreadable directory is partial coverage. Vendor unit trees and `/run` stay with aftercve's one-shot snapshot. | `persistence.baseline`, `persistence.change`, `history.devnull` |
+| `auditd` | 2 s | `/var/log/audit/audit.log` (RAW or ENRICHED format; the part after `0x1D` is ignored) | `audit.exec` (with `truncated: true` when argv was cut), `log.tamper`, `log.skipped` |
 
 Sensor meta events: `sensor.start` (version, boot id, coverage), and
 `sensor.events_dropped` (spool overflow count, section 8).
+
+Every log source (authlog, packages, auditd) shares one tailer. It keeps
+draining a rotated inode to EOF across polls (not one bounded read), reports
+lag (coverage is `partial` above 8 MiB behind), emits `log.skipped` when a
+rotated or replaced inode is lost before it was drained, and keeps a SHA-256
+of the 4 KiB before its read offset: if those bytes change in place the
+source raises `{authlog,pkglog,auditlog}.rewritten`. Lines are capped at
+16 KiB (the kernel's audit record limit is about 9 KiB).
 
 ### Signals (hints, not verdicts)
 
@@ -174,6 +211,10 @@ incident (the rule id is stable, versioned by name):
 | new or changed persistence file | `persist.changed` | medium; high for `ld.so.preload` and `ld.so.conf.d`, `authorized_keys`, sudoers, account files, sshd, PAM, D-Bus system policy, polkit, udev, modprobe |
 | short-lived exec recorded as `audit.exec` (same process rules as a live process) | `proc.miner_cmdline`, `proc.masquerade`, `proc.exe_hidden_dir` | critical / high / medium |
 | audit.log truncated, replaced in place, deleted, or turned into a symlink | `auditlog.truncated`, `auditlog.replaced`, `auditlog.deleted`, `auditlog.symlink` | high |
+| already-read log bytes edited in place (same inode, same or larger size) | `authlog.rewritten`, `pkglog.rewritten`, `auditlog.rewritten` | high |
+| log bytes lost before they were read (rotated twice before drained) | `log.skipped` | high |
+| user process with kthreadd (pid 2) as parent but no PF_KTHREAD | `proc.fake_kthread` | high |
+| `core_pattern`, kernel `modprobe` path, or `uevent_helper` changed | `persist.changed` (category `kernel_hook`) | high |
 
 Negative requirements baked into tests: Playwright's Chromium under
 `/root/.cache/ms-playwright/` (allowlisted) does not get any miner/masquerade
@@ -202,9 +243,20 @@ the IOC list.
   store.
 - Times are Unix milliseconds from the sensor clock (untrusted). The store
   records its own `received_at_ms` next to every event; aftercve should
-  compare both.
+  compare both. Store-side correlation (`fleet.password_sweep`), retention,
+  quotas and the alert cursor use the store clock only. A heartbeat whose
+  `sent_at_ms` is more than 2 min off the store clock raises
+  `sensor.clock_skew` (medium, once per hour); more than 15 min off, the
+  heartbeat is refused (high).
 - Raw log timestamps are kept verbatim (`log_time`) because syslog lines have
   no year and may be in local time.
+- Socket addresses (`net.connect`, `net.listen`): addresses and ports are
+  separate fields. `remote_ip` + `remote_port` always were; `local_ip` +
+  `local_port` were added 2026-10 (absent in older events). The old `local`
+  string is kept for compatibility and is `SocketAddr` text: `1.2.3.4:22`
+  for IPv4, `[::1]:9998` for IPv6 (before 2026-10 IPv6 was the ambiguous
+  `::1:9998`). Consumers should read the split fields; anyone parsing
+  `local` must handle the bracketed form. Signal summaries use the same text.
 
 ## 6. Tamper evidence: hash chain + HMAC
 
@@ -240,6 +292,14 @@ contiguous sequence numbers, <= 500 envelopes, <= 1 MiB):
 | `seq > next_seq` (events missing) | accepted, gap `[next_seq, seq-1]` recorded, alert `chain.gap` |
 | new epoch, starts at seq 0 from genesis | accepted; alert `chain.reset` if the host had an earlier epoch |
 | new epoch not starting at 0 / not from genesis | accepted as gap from 0, alert `chain.gap` |
+| `seq` equals the seq a heartbeat attested, different link | 409 `rewrite`, alert `chain.rewrite` (critical) |
+| host over its daily byte or row quota | 429 `quota_exceeded` (`Retry-After: 300`), one `host.quota_exceeded` per day |
+
+Event-specific rejections name the envelope (`bad_seq`). The sensor then
+resends only the envelopes before it, then the bad one alone, and moves just
+that one to `rejected.jsonl`; without a `bad_seq` it halves the batch.
+Batch-level rejections (`stale_epoch`, `batch_not_contiguous`,
+`bad_batch_size`, `host_mismatch`) move the batch aside whole.
 
 Gaps are accepted rather than rejected on purpose: rejecting would make the
 sensor retry forever and we would lose the events that did arrive. Evidence is
@@ -252,16 +312,42 @@ store means someone removed spooled events (or the disk failed).
 
 Heartbeats (`POST /v1/heartbeat`) are not in the chain; each carries a strictly
 increasing counter (per epoch), the sensor's chain head `(seq, link)`, spool
-depth, drop count and source coverage, all MACed. The store rejects a
-non-increasing counter (409 `replay`) and alerts when the sensor's claimed head
-is *behind* what the store already has (`chain.rollback`: the sensor's state
-was restored or forged). "Sensor has events the store has not seen" is normal
-backlog and is shown, not alerted.
+depth, drop count, source coverage and `last_tick_ms` (when the poll loop
+last completed), all MACed. Every field is size- and format-checked
+(400 `malformed_payload`). The store:
+
+- accepts a heartbeat only for its current chain epoch, or for a brand-new
+  epoch with no stored events (a sensor that just restarted); a heartbeat for
+  an older epoch that has events is a replay (409 `replay`,
+  `chain.heartbeat_replay`);
+- keeps the highest counter and highest attested `next_seq` per epoch
+  (`hb_epochs`) and rejects a non-increasing counter for that epoch, so
+  alternating replays between two epochs fail too;
+- refuses `sent_at_ms` more than 15 min from the store clock;
+- alerts `chain.rollback` when the claimed head is behind what the store holds
+  OR behind an earlier heartbeat of the same epoch (spooled events were
+  deleted and the state rewound before shipping);
+- stores the attested `(next_seq - 1, head)` and raises `chain.rewrite` if the
+  event at that seq is stored, or later arrives, with a different link;
+- raises `sensor.stalled` once when `sent_at_ms - last_tick_ms > 60 s`.
+
+"Sensor has events the store has not seen" is normal backlog and is shown,
+not alerted. Known false positive: a power loss between a spool append and
+its fsync, after a heartbeat attested it, reads as rollback/rewrite.
+
+When the sensor's host key changes (rekey), the spool's old envelopes can
+never verify at the store: the sensor moves them to `spool.rekeyed.jsonl`
+and starts a new epoch (`chain.reset` at the store, expected on a rekey).
+The sensor commits chain state only after the spool append succeeded, so a
+failed write never creates a gap.
 
 **Silence:** the store runs a checker every 10 s; a host with no event and no
 heartbeat for `silent_after_secs` (default 120 s = 4 missed heartbeats) gets
 one `sensor.silent` alert (high), and `sensor.resumed` (medium) when it comes
-back. `GET /v1/hosts` computes the silent flag live.
+back. A host with an active key that has never reported for
+`silent_after_secs` after the key was minted gets one
+`sensor.never_reported` (high). `GET /v1/hosts` computes the silent flag live
+and shows `last_tick_ms` and `stalled`.
 
 ## 7. Keys and tokens
 
@@ -276,8 +362,11 @@ back. `GET /v1/hosts` computes the silent flag live.
   DoS surface. (SECURITY-RULES rule 3 is about passwords.)
 - Admin tokens: `nva1.<id>.<secret>`, same storage, separate table, required
   for every GET. Minted with `nocve-store admin mint`.
-- Revocation: `keys revoke --key-id` / `--host`; immediate (checked per
-  request).
+- Revocation: `keys revoke --key-id ID`, `--host H` (every key of H minted up
+  to now), or `--host H --key-id OLD` (rotation: OLD and older keys of H; a
+  key minted after OLD is kept); immediate (checked per request). `keys mint`
+  warns when the host then has more than one active key, and deletes the key
+  row again if the token could not be written to stdout (no orphan keys).
 - The sensor sends the token only in `Authorization: Bearer`; never in the URL,
   argv or logs. Logs show a SHA-256 fingerprint of the key id at most.
 
@@ -287,18 +376,40 @@ back. `GET /v1/hosts` computes the silent flag live.
   `http://127.0.0.1|[::1]|localhost` for tests. System CA store
   (`rustls-platform-verifier`), no redirects, no proxy (environment proxy
   variables ignored), 10 s global timeout, response bodies capped at 64 KiB.
+- TLS position (SECURITY-RULES rule 5): the sensor uses rustls defaults,
+  which negotiate TLS 1.3 and allow TLS 1.2 only with rustls's AEAD-only
+  ECDHE suite list (no CBC, no RSA key exchange, no SHA-1). That is the
+  "1.2 with pinned suites" case of rule 5. Restricting to 1.3 only is a
+  one-line `TlsConfig` change once Traefik on the store host is confirmed
+  to offer 1.3 (it does by default). There is **no certificate or key
+  pinning** of the store: trust is the system CA store. An attacker who can
+  get a publicly trusted certificate for the store name can read the bearer
+  secret. Pinning (SPKI of the store cert, or a private CA) is deferred.
+- The bearer secret is the MAC root: `Authorization: Bearer nvk1...` sends the
+  secret whose HMAC is the per-event MAC key. Planned replacement (designed,
+  not built): **HMAC request signing**. The sensor sends only the key id and
+  `X-Nocve-Sig = HMAC(request_key, method || path || sha256(body) || ts ||
+  nonce)`, with `request_key = HMAC(secret, "nocve-req-v1")`; the store
+  checks the timestamp window (60 s) and a nonce cache, and the secret never
+  leaves the host. Until then, TLS is the only protection of the secret in
+  transit.
 - Spool: append-only JSONL of chained envelopes in `/var/lib/nocved/spool`
   plus `state.json` (epoch, next seq, head, heartbeat counter, acked seq), all
   0600, written atomically (temp + fsync + rename). Default cap 8 MiB; events
   with severity >= high may use a 25 % reserve above the cap. When full, new
   events are dropped before chaining and counted (section 6).
 - Shipping: batches of up to 500 envelopes / 1 MiB; on failure exponential
-  backoff 1 s .. 60 s with CSPRNG jitter; 429 honours `Retry-After`; a 409 or
-  422 batch is moved to a bounded `rejected.jsonl` (kept for aftercve) and
-  shipping continues, so one bad batch cannot wedge the sensor.
+  backoff 1 s .. 60 s with CSPRNG jitter; 429 honours `Retry-After` (capped at
+  60 s); a rejected batch is split around the offending envelope (section 6)
+  and only that envelope is moved to a bounded `rejected.jsonl` (kept for
+  aftercve), so one bad event cannot wedge the sensor or take good events
+  with it.
 - Store side: body limit 1 MiB (checked from `Content-Length` before reading
   and enforced while reading), per-host token bucket (default 5 req/s, burst
-  20), global unauthenticated bucket, payload <= 64 KiB per event.
+  20), global unauthenticated bucket, payload <= 64 KiB per event. Per host
+  per store-clock UTC day: 256 MiB of payload, 500 000 events, 2 000 alerts
+  (`--host-daily-bytes/-rows/-alerts`); per (host, rule): 20 alerts per
+  10 min (`--alert-burst`).
 
 ## 9. Privacy and secret hygiene
 
@@ -313,8 +424,22 @@ back. `GET /v1/hosts` computes the silent flag live.
   token (`ghp_`, `github_pat_`, `xox?-`, `sk-`, `AKIA`, `eyJ` JWTs, `iak_`,
   `nvk1.`, `nva1.`). Masked values become `<masked>`. Each argument is capped at
   512 bytes, the whole line at 4 KiB. The `chpasswd` pattern from the incident
-  (`echo 'root:...' | chpasswd`) runs in a shell whose cmdline is masked by
-  the `user:secret` rule for `chpasswd`-style arguments.
+  (`echo 'root:...' | chpasswd`, `chpasswd <<<'root:...'`) runs in a shell
+  whose cmdline is masked by the `user:secret` rule for `chpasswd`-style
+  arguments, after redirection and quote characters are stripped.
+- Tool rules: `curl`/`wget` `-u`/`--user`/`--proxy-user` (and `-uUSER:PW`)
+  keep the user and mask the password; `sshpass -p PW` and `-pPW`;
+  `redis-cli -a PW`; `docker|podman|nerdctl|... login -p PW` (only with
+  `login`: `docker run -p 8080:80` is a port); `htpasswd -b ... PW` (last
+  positional); `openssl passwd [...] PW` (every positional except `-salt`/`-in`
+  values); `mysql`-family `-pPW`.
+- A secret assignment masks its whole value even across whitespace
+  (`--password='hun ter2'`, `PASSWORD=a b`). Script arguments (`sh -c`, any
+  argument with whitespace or `< > | ;`) are tokenised shell-style (quotes
+  kept together, split at operators) and each command is masked with its own
+  tool rules. Scripts over 16 KiB are masked up to the last whitespace before
+  16 KiB and the rest replaced by `…` (no token is cut); nesting deeper than
+  4 levels is masked whole.
 - The miner-cmdline detector looks at the unmasked line in memory only, and
   ships the masked form.
 - Log lines are parsed into fields; raw auth.log lines are not shipped (they can
@@ -387,7 +512,10 @@ Capabilities: `CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE`,
 `ReadWritePaths=/var/lib/nocved`, `ProtectHome=read-only`,
 `PrivateTmp=yes`, `ProtectKernelTunables/Modules/Logs=yes`,
 `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `SystemCallFilter=@system-service`,
-`MemoryMax=128M`, `CPUQuota=5%`, `Nice=10`. `ProcSubset=all` and
+`MemoryMax=128M`, `CPUQuota=5%`, `Nice=10`, `IOSchedulingClass=best-effort`
+with `IOSchedulingPriority=7` (not `idle`, which an attacker's I/O load can
+starve indefinitely), `Type=notify` with `WatchdogSec=60` fed from the poll
+loop (manual `sd_notify` datagram, no dependency). `ProcSubset=all` and
 `ProtectProc=default` are required (the sensor must see all pids).
 `CAP_SYS_PTRACE` lets nocved read other processes' memory in principle; nocved
 never opens `/proc/<pid>/mem` or `environ`. A future unprivileged mode can
@@ -432,23 +560,90 @@ Ansible playbook, key minted on the controller and written with `no_log`.
     while the sensor was silent).
 - aftercve reports store-derived observations with provenance
   `nocve-store` and trust `off-host history, chain-verified` distinct from
-  live-host observations. The client is deferred to the aftercve agent.
+  live-host observations. The client exists in aftercve
+  (`src/store_client.rs`, `src/crossview.rs`). It currently fetches
+  `/v1/alerts` fleet-wide and filters by host client-side; it should move to
+  `?after_id=&host=` (section 15), which the store now serves.
 
 ## 15. Store
 
 - `tiny_http` server, worker threads, binds `127.0.0.1:8750` by default; TLS
   terminated by Traefik (file provider route, like other services).
+- Unit hardening (`deploy/nocve-store.service`): `DynamicUser`, empty
+  capability set, `SystemCallFilter=@system-service ~@privileged @resources`,
+  `RestrictSUIDSGID`, `ProtectClock`, `ProtectHostname`, and
+  `IPAddressDeny=any` + `IPAddressAllow=localhost` (it only talks to the
+  local proxy).
+- `GET /healthz` is the only unauthenticated read; it reports that a worker
+  answered, not database or fleet health.
 - SQLite (bundled, WAL, `synchronous=NORMAL`, foreign keys on), one
   connection behind a mutex: the fleet is ~10 hosts.
-- Tables: `hosts` (chain state, last seen, coverage, silent flag), `keys`,
-  `admin_tokens`, `events`, `gaps`, `alerts`.
+- Tables: `hosts` (chain state, last seen, coverage, silent/stalled flags,
+  `last_tick_ms`), `keys`, `admin_tokens`, `events`, `gaps`, `alerts`,
+  `hb_epochs` (per-epoch heartbeat counter, max attested `next_seq`, attested
+  head), `ssh_logins` + `sweep_alerts` (typed sweep correlation),
+  `host_quota`, `alert_rate`. New `hosts` columns are added in place on open.
 - Store-side correlation at insert time: `fleet.password_sweep` (same source IP,
-  password login on >= 3 distinct hosts within 30 min: critical).
-- Alerts = events whose max signal severity >= high, chain anomalies, silence.
-  `GET /v1/alerts?since&min_severity&limit` returns them ordered by
-  `(occurred_at_ms, id)`.
+  verified password login on >= 3 distinct hosts within 30 min of STORE
+  receive time: critical). It reads the typed `ssh_logins` table (maintained
+  on ingest, keyed by `received_at_ms`), not `json_extract` over events, so
+  a backdated sensor clock cannot dodge it and the query stays indexed.
+- Alerts = events whose max signal severity >= high, chain anomalies, silence,
+  stalls, quota and rate-limit notices. `GET /v1/alerts` takes
+  `after_id` (page by the store's alert id; ordered by id; the cursor to poll
+  with), `host` (that host plus fleet-wide alerts), `min_severity`, `limit`,
+  and returns `next_after_id`. The legacy `since` filters on
+  `occurred_at_ms`, which for event alerts is the sensor clock: a late or
+  backdated alert can land behind a `since` cursor, so `since` is kept only
+  for compatibility and ordered by `(occurred_at_ms, id)`.
 - Retention: events older than `retention_days` (default 90) deleted hourly;
   alerts and gaps kept for `alert_retention_days` (default 400).
+- `GET /v1/hosts` also reports `feed: {skipped_long, skipped_burst}` from the
+  sensor heartbeat (null when the host runs no cveguard feed, section 21).
+
+### Alert forwarder to darksignal (P5)
+
+`nocve-store forward --darksignal-socket PATH --cursor FILE [--db PATH]
+[--host NAME]` is a separate process (`deploy/nocve-store-forward.service`),
+not a thread in `serve`: the HTTP server keeps no darksignal group and no
+Unix-socket client, and the forwarder gets no network at all
+(`PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`).
+It opens the database `query_only` and reads alerts with the same query as
+`GET /v1/alerts?after_id=` (ordered by id, every severity).
+
+- Frame: u32 little-endian length, then
+  `{"v":1,"tool":"nocve-store","host":<store host>,"sent_at_ms":<now>,"body":<row>}`
+  where `<row>` is the alert row exactly as `GET /v1/alerts` returns it
+  (`id`, `host`, `rule`, `severity`, `summary`, `occurred_at_ms`,
+  `raised_at_ms`, `event_id`, `detail`). JSON at most 65532 bytes, so the
+  frame is at most 64 KiB. `host` is the kernel hostname or `--host`, checked
+  at start against the shared host rule below.
+- Host rule (`nocve_proto::valid_host`, also darksignal's): a DNS name of
+  1-253 bytes, dot-separated labels of 1-63 bytes from `[A-Za-z0-9_-]`, no
+  empty label (no leading, trailing or double dot). The sensor config, key
+  mint, envelope and heartbeat verification, and the forwarder all use it, so
+  no alert the store raises names a host darksignal would refuse (a refusal
+  advances the cursor, so it would be lost). A key minted under the older
+  looser rule is refused at ingest (403 `bad_host`); re-mint it.
+- Ack: `0x01` advances the cursor. `0x00` (refused) advances it and counts a
+  refusal (logged at 1, 2, 4, 8, ... refusals): a refusal is darksignal's
+  final answer. Anything else (connect error, no byte, a short read, another
+  byte) leaves the cursor and backs off 1 s, doubling, capped at 5 min;
+  a delivered or idle pass resets it. Idle polling is every 2 s.
+- Cursor: the last answered alert id as decimal text, in a 0600 file written
+  by temp file + fsync + rename + directory fsync. Missing = start at 0 (all
+  retained alerts). A corrupt or symlinked cursor stops the forwarder.
+- Oversized rows: re-encoded with `detail: null`; if still too large, skipped,
+  counted and logged by id (cursor advances). Never cut mid-JSON.
+- Deploy: `User=nocve-store` (create the static system user so darksignal can
+  name a fixed uid; `DynamicUser=` then uses it and both units share
+  `StateDirectory=nocve-store`), `SupplementaryGroups=darksignal-producers`
+  (darksignal's socket is 0660 in that group when `socket_gid` is set), the
+  same hardening as the store, `MemoryMax=64M`. darksignal's store-mode
+  config needs `"producers": {"nocve-store": {"exe":
+  "/usr/local/bin/nocve-store", "uid": <uid>}}`.
+- darksignal derives the signal's `source_ref` (`nocve-store.alert`) from
+  the row's `id`.
 
 ## 16. Rollout
 
@@ -466,8 +661,12 @@ Ansible playbook, key minted on the controller and written with `no_log`.
 - journald auth source for rsyslog-less Debian 12 hosts.
 - Forward-secure MAC key ratchet (`k[e+1] = HMAC(k[e], "ratchet")` per hour,
   old keys erased) so a later root compromise cannot forge earlier events.
+  Still not built: today a root attacker with the key can forge any event
+  that no heartbeat has attested yet.
 - Ed25519 per-host signatures so a store DB leak cannot forge history.
-- aftercve store client and cross-view commands (another agent).
+- HMAC request signing instead of the bearer MAC root (section 8).
+- Store certificate pinning or a private CA (section 8).
+- aftercve: switch its alert fetch to `after_id` + `host=` (section 14).
 - Alert delivery (email/webhook), UI.
 - Per-host policy tuning (e.g. hosts that legitimately use password SSH).
 
@@ -495,8 +694,10 @@ Ansible playbook, key minted on the controller and written with `no_log`.
   (first one on ties) as the alert rule and keeps all signals in `detail`.
 - `invalid user NAME` usernames are shipped as `<invalid>` (they are
   attacker-supplied and are sometimes a mistyped password).
-- Kernel threads (PF_KTHREAD / ppid 2) are not reported; a user process that
-  merely *names* itself like one is (`proc.masquerade`).
+- Kernel threads (PF_KTHREAD, or pid 2 itself) are not reported. The parent
+  pid is not evidence: a user process whose ppid is 2 but lacks PF_KTHREAD is
+  reported with `proc.fake_kthread` (high). A user process that merely
+  *names* itself like a kernel thread is `proc.masquerade`.
 - The sensor fsyncs only when a poll produced events; idle ticks do no disk I/O.
 - `nocved check` polls every source once and prints coverage; it sends nothing.
 - Measured on the build Mac (release binary, fixture root with 600 processes,
@@ -520,5 +721,87 @@ Ansible playbook, key minted on the controller and written with `no_log`.
 | rusqlite (bundled) | store | embedded SQLite with WAL, no system lib dependency |
 | tempfile (dev) | tests | fixture roots |
 
+No dependency was added for systemd notify (a `UnixDatagram` send to
+`$NOTIFY_SOCKET`) or for the cveguard feed.
+
 No async runtime, no CLI framework, no logging framework (plain stderr lines,
 journald captures them).
+
+## 21. Read-only feed for cveguard (optional)
+
+cveguard's `afterguard` runs as its own unprivileged user and cannot read the
+0700 spool. With `"feed": {"enabled": true, "group": "cveguard"}` in the
+config, nocved also appends every envelope line it writes to `spool.jsonl`,
+unchanged, to `/var/lib/nocved/cveguard-feed/events.jsonl` (configurable
+`dir`). Off by default.
+
+- Directory 0750, file 0640, both with the configured group (a name from
+  `/etc/group` or a numeric gid). When the feed directory is inside the
+  state directory (the default), the state directory becomes 0710 with the
+  feed group: the reader can traverse it but not list it; spool and state
+  files stay 0600. A feed inside the state directory without a group is
+  refused. nocved has no `CAP_CHOWN`, so the unit needs
+  `SupplementaryGroups=cveguard` (commented in `nocved.service`). Modes are
+  enforced on every open; a symlinked feed file is refused (`O_NOFOLLOW`).
+- Bounded: when the next line would exceed `max_bytes` (default 4 MiB), the
+  file is renamed to `events.jsonl.1` and a fresh file is renamed into place
+  (a new inode; afterguard tracks `(dev, ino)` and skips `(epoch, seq)` it
+  already saw). A feed file removed or replaced behind nocved's back is
+  recreated the same way (that path never touches `.1`).
+- Rotation contract for readers (cveguard drains the old inode via
+  `events.jsonl.1` and checks its `(dev, ino)`):
+  1. Exactly ONE old generation is kept: `events.jsonl.1`. There is no `.2`.
+  2. Rotation is: rename `events.jsonl` to `events.jsonl.1` (atomically
+     replacing the older `.1`), then create the new `events.jsonl` (temp file
+     renamed into place). Between the two steps `events.jsonl` may briefly
+     not exist; a reader treats that as "no new data yet".
+  3. Neither file is ever truncated or rewritten in place. A reader holding
+     an fd on an old generation keeps reading it after any rename.
+  4. Burst hold: nocved never replaces `.1` sooner than 60 s
+     (`ROTATE_HOLD`) after it created it (a `.1` found at startup counts as
+     just created). If the live file fills again inside that window it may
+     grow to `2 * max_bytes`; beyond that, new lines are skipped and counted
+     (`skipped_burst`) instead of rotating an undrained `.1` away. So a reader
+     that drains `.1` within 60 s of seeing the inode change never loses a
+     line, and any loss nocved causes is counted, not silent.
+  5. A reader slower than that can still lose a generation. Envelopes carry
+     a contiguous `(epoch, seq)`, so the reader detects the gap.
+- Lines over 8192 bytes are skipped (afterguard rejects them) and counted.
+- Skipped lines are reported: the heartbeat carries `feed_skipped_long` and
+  `feed_skipped_burst` (absent without a feed), the store shows them in
+  `GET /v1/hosts` (`feed`), and coverage says `feed: completed`, or
+  `feed: degraded` with the counts once any line was skipped. `degraded` is
+  a coverage status added for this; deploy the store before the sensors.
+- Envelopes carry the per-event MAC, never the MAC key or token. A feed
+  error is logged and never affects the chain; a feed that cannot be opened
+  at start is reported as coverage `feed: failed` and the sensor runs on.
+- The reader cannot verify envelopes (it holds no key); anyone who can write
+  the directory could forge feed lines. That is cveguard's documented trust
+  boundary.
+
+## 22. Security review 2026-10-01: status
+
+Fixed (each with a negative test): C1 store panic before auth; H1 FIFO
+freeze (O_NONBLOCK + fstat, `last_tick_ms`, `sensor.stalled`, systemd
+watchdog); H2 masking gaps; H3 store quotas, alert rate limit, typed sweep
+table; M1 attested truncation/rewrite; M2 heartbeat replay; M3 alert cursor,
+`host=`, `sensor.clock_skew`; M4 auditd ENRICHED/truncation/split args/
+coverage/rule; M5 tail drain, lag, `log.skipped`, rewrite digest; M6
+`logger` injection; M7 bounded directory read; M8 PF_KTHREAD-only, kernel
+hooks; LOW 1, 2, 3, 6, 7, 8, 10; docs for LOW 4, 5, 9.
+
+Cross-repo end-to-end fixes (2026-10-01, each with a test that fails
+without it): B5 feed `skipped_long` reported (heartbeat, coverage
+`feed: degraded`, `/v1/hosts`); B15 IPv6 `local` bracketed plus
+`local_ip`/`local_port`; feed rotation hold (one `.1` generation, never
+replaced within 60 s); P5 alert forwarder to darksignal (section 15).
+
+Remains (honest list):
+
+- Forward-secure key ratchet, Ed25519 signatures, HMAC request signing,
+  store pinning (section 17).
+- `sshd` pid verification is defeated by naming a live sshd's pid.
+- Rollback/rewrite detection covers only what a heartbeat attested.
+- No measurement yet on a Linux VM (`scripts/measure.sh`), and no run against
+  a real auditd in ENRICHED format: the parser is tested from the reviewer's
+  probe lines only.

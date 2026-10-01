@@ -4,9 +4,15 @@
 //!
 //! Threats: short-lived exec evidence leaves the host before the process
 //! exits. Secrets in argv are masked. Raw audit lines and `PROCTITLE` are
-//! never shipped. Bad, oversized, and incomplete records are dropped and
-//! never chained. At most 32 audit ids are assembled at once, and only the
-//! newest incomplete id is held across polls.
+//! never shipped. Malformed and incomplete records are dropped and never
+//! chained. An exec with more than 128 arguments or an argument over 4 KiB is
+//! NOT dropped: it is emitted with the first arguments, each capped, and
+//! `truncated: true` (an attacker cannot hide an exec by padding argv). The
+//! kernel's split form (`aN_len=`, `aN[k]=`) is reassembled. ENRICHED-format
+//! lines are cut at the 0x1D separator. At most 32 audit ids are assembled at
+//! once, and only the newest incomplete id is held across polls. Coverage is
+//! partial when no `EXECVE` record arrived for 5 minutes (no execve rule
+//! loaded, or auditd stopped writing).
 //! This does NOT prove the exec happened if root forges the log or holds the
 //! MAC key. It does NOT see execs that never reach `audit.log`. It does NOT
 //! follow symlinks (the tailer opens with `O_NOFOLLOW`).
@@ -15,20 +21,28 @@ use std::path::Path;
 use std::time::Duration;
 
 use nocve_proto::mask::mask_argv;
-use nocve_proto::{
-    AuditExecInfo, Coverage, CoverageStatus, Event, EventData, ProcessInfo, Severity, Signal,
-};
+use nocve_proto::{AuditExecInfo, Coverage, CoverageStatus, Event, EventData, ProcessInfo};
 
 use super::process::process_signals;
-use super::tail::{Anomaly, Tailer};
-use super::{Ctx, MAX_EVENTS_PER_POLL, Source, cap_events, coverage};
+use super::tail::Tailer;
+use super::{
+    Ctx, LAG_PARTIAL_BYTES, MAX_EVENTS_PER_POLL, Source, cap_events, coverage, tail_events,
+};
 use crate::config::SourceToggle;
 
 const AUDIT_LOG: &str = "/var/log/audit/audit.log";
 const DEFAULT_INTERVAL_SECS: u64 = 2;
 const MAX_OPEN: usize = 32;
+/// Arguments kept per exec; later ones are counted, not stored.
 const MAX_ARGC: usize = 128;
+/// Largest argc accepted as a number at all.
+const MAX_ARGC_FIELD: usize = 1 << 20;
+/// Bytes kept per argument (and per exe/comm).
 const MAX_DECODED: usize = 4096;
+/// Largest `aN_len=` accepted (the kernel's MAX_ARG_STRLEN is 128 KiB).
+const MAX_SPLIT_LEN: usize = 1 << 20;
+/// No `EXECVE` record for this long: coverage is partial.
+pub const EXECVE_SILENCE_MS: i64 = 300_000;
 const MAX_FIELDS: usize = 256;
 const MAX_TIME_LEN: usize = 32;
 const MAX_NUM_LEN: usize = 20;
@@ -52,6 +66,9 @@ struct Group {
     comm: Option<String>,
     argc: Option<usize>,
     args: Vec<Option<String>>,
+    /// Split arguments being reassembled: (index, declared length, bytes seen, kept bytes).
+    split: Vec<(usize, usize, usize, Vec<u8>)>,
+    truncated: bool,
     flags: u8,
 }
 
@@ -69,6 +86,8 @@ impl Group {
             comm: None,
             argc: None,
             args: Vec::new(),
+            split: Vec::new(),
+            truncated: false,
             flags: 0,
         }
     }
@@ -98,6 +117,10 @@ pub struct AuditSource {
     health: Coverage,
     loud_drops: u64,
     capped: bool,
+    started_ms: Option<i64>,
+    last_execve_ms: Option<i64>,
+    saw_execve: bool,
+    lag_bytes: u64,
     /// Highest audit serial seen this poll, including ids already closed.
     /// Rebuilt from the open set at the start of each poll so a restart can
     /// reuse low serials. An incomplete exec is held only when it is this serial.
@@ -116,6 +139,10 @@ impl AuditSource {
             health: coverage("auditd", CoverageStatus::Skipped, "not polled yet"),
             loud_drops: 0,
             capped: false,
+            started_ms: None,
+            last_execve_ms: None,
+            saw_execve: false,
+            lag_bytes: 0,
             seen_max: None,
         }
     }
@@ -135,7 +162,9 @@ impl AuditSource {
         evs: &mut Vec<Event>,
         holdable: bool,
     ) -> Option<Group> {
-        if exec_complete(&g) {
+        // A truncated exec may still have argument records coming; wait for EOE
+        // while it is the newest id.
+        if exec_complete(&g) && !(holdable && g.truncated && !g.has(F_EOE)) {
             match self.event_for(&g, now_ms) {
                 Some(ev) => evs.push(ev),
                 None => self.note_loud(),
@@ -163,7 +192,7 @@ impl AuditSource {
         let raw = raw_argv(g)?;
         let view = view_process(g);
         let signals = process_signals(&self.ctx.ind, &view, &raw);
-        let argc = u32::try_from(raw.len()).ok()?;
+        let argc = u32::try_from(g.argc.unwrap_or(raw.len())).unwrap_or(u32::MAX);
         let info = AuditExecInfo {
             serial: g.serial,
             audit_time: g.audit_time.clone(),
@@ -175,6 +204,7 @@ impl AuditSource {
             comm: g.comm.as_deref().map(|s| clip_chars(s, MAX_COMM_CHARS)),
             argc,
             argv: mask_argv(&raw),
+            truncated: g.truncated,
         };
         Some(Event::new(now_ms, "auditd", EventData::AuditExec(info)).with_signals(signals))
     }
@@ -275,6 +305,7 @@ impl AuditSource {
                 }
             }
             "EXECVE" => {
+                self.saw_execve = true;
                 if let Some(g) = self.open.get_mut(idx) {
                     apply_execve(g, rec.body);
                 }
@@ -300,15 +331,14 @@ impl AuditSource {
     fn drain_tail(&mut self, now_ms: i64, evs: &mut Vec<Event>) {
         let shown = shown_path(&self.ctx.root, self.tailer.path());
         let output = self.tailer.poll();
-        for anomaly in &output.anomalies {
-            evs.push(tamper(now_ms, &shown, anomaly));
-        }
+        tail_events("auditd", "auditlog", now_ms, &shown, &output, evs);
+        self.lag_bytes = output.lag_bytes;
         for line in &output.lines {
             self.ingest_line(line, now_ms, evs);
         }
     }
 
-    fn coverage_for(&self, shown: &str) -> Coverage {
+    fn coverage_for(&self, shown: &str, now_ms: i64) -> Coverage {
         if !self.tailer.is_open() {
             return coverage(
                 "auditd",
@@ -316,7 +346,10 @@ impl AuditSource {
                 "no /var/log/audit/audit.log",
             );
         }
-        if !self.capped && self.loud_drops == 0 {
+        let quiet_since = self.last_execve_ms.or(self.started_ms).unwrap_or(now_ms);
+        let no_execve = now_ms - quiet_since >= EXECVE_SILENCE_MS;
+        let lagging = self.lag_bytes > LAG_PARTIAL_BYTES;
+        if !self.capped && self.loud_drops == 0 && !no_execve && !lagging {
             return coverage(
                 "auditd",
                 CoverageStatus::Completed,
@@ -330,6 +363,16 @@ impl AuditSource {
         if self.loud_drops > 0 {
             let n = self.loud_drops;
             detail.push_str(&format!("; dropped {n} incomplete exec records"));
+        }
+        if no_execve {
+            let secs = (now_ms - quiet_since) / 1000;
+            detail.push_str(&format!(
+                "; no EXECVE record for {secs}s (execve audit rule not loaded? see deploy/audit/nocved.rules)"
+            ));
+        }
+        if lagging {
+            let lag = self.lag_bytes;
+            detail.push_str(&format!("; {lag} bytes behind"));
         }
         coverage("auditd", CoverageStatus::Partial, detail)
     }
@@ -352,13 +395,20 @@ impl Source for AuditSource {
     fn poll(&mut self, now_ms: i64, out: &mut Vec<Event>) {
         self.loud_drops = 0;
         self.capped = false;
+        self.saw_execve = false;
+        if self.started_ms.is_none() {
+            self.started_ms = Some(now_ms);
+        }
         self.seen_max = self.open.iter().map(|g| g.serial).max();
         let mut evs = Vec::new();
         self.drain_tail(now_ms, &mut evs);
         self.end_poll(now_ms, &mut evs);
+        if self.saw_execve {
+            self.last_execve_ms = Some(now_ms);
+        }
         cap_events("auditd", now_ms, evs, MAX_EVENTS_PER_POLL, out);
         let shown = shown_path(&self.ctx.root, self.tailer.path());
-        self.health = self.coverage_for(&shown);
+        self.health = self.coverage_for(&shown, now_ms);
     }
 
     fn health(&self) -> Coverage {
@@ -373,43 +423,6 @@ fn shown_path(root: &Path, path: &Path) -> String {
     )
 }
 
-fn tamper(now_ms: i64, path: &str, anomaly: &Anomaly) -> Event {
-    let (rule, reason, detail) = match anomaly {
-        Anomaly::Truncated { from, to } => (
-            "auditlog.truncated",
-            "truncated",
-            format!("{path} shrank from {from} to {to} bytes"),
-        ),
-        Anomaly::Replaced {
-            old_inode,
-            new_inode,
-            old_unlinked,
-        } => (
-            "auditlog.replaced",
-            "replaced",
-            format!(
-                "{path} replaced in place (inode {old_inode} -> {new_inode}, old unlinked: {old_unlinked}); typical of sed -i"
-            ),
-        ),
-        Anomaly::Deleted => ("auditlog.deleted", "deleted", format!("{path} was deleted")),
-        Anomaly::Symlink => (
-            "auditlog.symlink",
-            "symlink",
-            format!("{path} is now a symlink (not followed)"),
-        ),
-    };
-    Event::new(
-        now_ms,
-        "auditd",
-        EventData::LogTamper {
-            path: path.to_owned(),
-            reason: reason.to_owned(),
-            detail: detail.clone(),
-        },
-    )
-    .with_signals(vec![Signal::new(rule, Severity::High, detail)])
-}
-
 fn exec_complete(g: &Group) -> bool {
     if g.has(F_BAD) {
         return false;
@@ -417,11 +430,12 @@ fn exec_complete(g: &Group) -> bool {
     let Some(n) = g.argc else {
         return false;
     };
-    n <= MAX_ARGC && g.args.len() == n && g.args.iter().all(Option::is_some)
+    let kept = n.min(MAX_ARGC);
+    g.args.len() == kept && g.args.iter().all(Option::is_some)
 }
 
 fn raw_argv(g: &Group) -> Option<Vec<String>> {
-    let n = g.argc?;
+    let n = g.argc?.min(MAX_ARGC);
     if g.args.len() < n {
         return None;
     }
@@ -466,11 +480,17 @@ fn lowest_index(open: &[Group]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// ENRICHED log format appends interpreted fields after a 0x1D byte; only the
+/// raw fields before it are parsed.
+fn raw_fields(body: &str) -> &str {
+    body.split('\u{1d}').next().unwrap_or("").trim_start()
+}
+
 fn apply_syscall(g: &mut Group, body: &str) {
     if g.has(F_SYSCALL) {
         return;
     }
-    let Ok(fields) = scan_fields(body.trim_start()) else {
+    let Ok(fields) = scan_fields(raw_fields(body)) else {
         return;
     };
     g.mark(F_SYSCALL);
@@ -507,7 +527,7 @@ fn apply_execve(g: &mut Group, body: &str) {
     if g.has(F_BAD) {
         return;
     }
-    let Ok(fields) = scan_fields(body.trim_start()) else {
+    let Ok(fields) = scan_fields(raw_fields(body)) else {
         g.mark(F_BAD);
         return;
     };
@@ -516,33 +536,119 @@ fn apply_execve(g: &mut Group, body: &str) {
             note_argc(g, v);
         } else if let Some(idx) = arg_index(k) {
             note_arg(g, idx, v);
+        } else if let Some(idx) = arg_len_index(k) {
+            note_split_len(g, idx, v);
+        } else if let Some(idx) = arg_chunk_index(k) {
+            note_split_chunk(g, idx, v);
         }
     }
-    if g.argc.is_some_and(|n| g.args.len() > n) {
+    if g.argc.is_some_and(|n| g.args.len() > n.min(MAX_ARGC)) {
         g.mark(F_BAD);
+    }
+}
+
+/// `aN_len=` (`a12_len`).
+fn arg_len_index(key: &str) -> Option<usize> {
+    arg_index(key.strip_suffix("_len")?)
+}
+
+/// `aN[k]=` (`a3[0]`): the argument index; chunks arrive in order.
+fn arg_chunk_index(key: &str) -> Option<usize> {
+    let (a, rest) = key.split_once('[')?;
+    let k = rest.strip_suffix(']')?;
+    if k.is_empty() || k.len() > 6 || !digits(k) {
+        return None;
+    }
+    arg_index(a)
+}
+
+fn note_split_len(g: &mut Group, idx: usize, raw: &str) {
+    if idx >= MAX_ARGC || g.argc.is_some_and(|n| idx >= n) {
+        // Counted by argc, not kept.
+        g.truncated = true;
+        return;
+    }
+    match parse_usize_digits(raw) {
+        Some(len) if len <= MAX_SPLIT_LEN && !g.split.iter().any(|s| s.0 == idx) => {
+            // A plain `aN=` already holds this index: the length is redundant.
+            if g.args.get(idx).is_none_or(Option::is_none) {
+                g.split.push((idx, len, 0, Vec::new()));
+            }
+        }
+        _ => g.mark(F_BAD),
+    }
+}
+
+fn note_split_chunk(g: &mut Group, idx: usize, raw: &str) {
+    if idx >= MAX_ARGC || g.argc.is_some_and(|n| idx >= n) {
+        g.truncated = true;
+        return;
+    }
+    let Some(pos) = g.split.iter().position(|s| s.0 == idx) else {
+        g.mark(F_BAD);
+        return;
+    };
+    let room = MAX_DECODED.saturating_sub(g.split[pos].3.len());
+    let Ok(Some((bytes, full))) = decode_capped(raw, room) else {
+        g.mark(F_BAD);
+        return;
+    };
+    let entry = &mut g.split[pos];
+    entry.2 = entry.2.saturating_add(full);
+    entry.3.extend_from_slice(&bytes);
+    if entry.2 > entry.1 {
+        g.mark(F_BAD);
+        return;
+    }
+    if entry.2 == entry.1 {
+        let (_, len, _, kept) = g.split.remove(pos);
+        if kept.len() < len {
+            g.truncated = true;
+        }
+        let val = String::from_utf8_lossy(&kept).into_owned();
+        if g.args.len() <= idx {
+            g.args.resize(idx + 1, None);
+        }
+        if let Some(slot) = g.args.get_mut(idx) {
+            *slot = Some(val);
+        }
     }
 }
 
 fn note_argc(g: &mut Group, raw: &str) {
     match parse_usize_digits(raw) {
-        Some(n) if n <= MAX_ARGC => match g.argc {
+        Some(n) if n <= MAX_ARGC_FIELD => match g.argc {
             Some(prev) if prev != n => g.mark(F_BAD),
             Some(_) => {}
-            None => g.argc = Some(n),
+            None => {
+                g.argc = Some(n);
+                if n > MAX_ARGC {
+                    g.truncated = true;
+                }
+            }
         },
         _ => g.mark(F_BAD),
     }
 }
 
 fn note_arg(g: &mut Group, idx: usize, raw: &str) {
-    if idx >= MAX_ARGC || g.argc.is_some_and(|n| idx >= n) {
+    if g.argc.is_some_and(|n| idx >= n) {
         g.mark(F_BAD);
         return;
     }
-    let Ok(Some(val)) = decode_encoded(raw) else {
+    if idx >= MAX_ARGC {
+        // Beyond the kept prefix: counted by argc only.
+        g.truncated = true;
+        return;
+    }
+    let Ok(Some((bytes, full))) = decode_capped(raw, MAX_DECODED) else {
         g.mark(F_BAD);
         return;
     };
+    if full > bytes.len() {
+        g.truncated = true;
+    }
+    let val = String::from_utf8_lossy(&bytes).into_owned();
     if g.args.len() <= idx {
         g.args.resize(idx + 1, None);
     }
@@ -550,7 +656,7 @@ fn note_arg(g: &mut Group, idx: usize, raw: &str) {
         g.mark(F_BAD);
         return;
     };
-    if slot.is_some() {
+    if slot.is_some() || g.split.iter().any(|s| s.0 == idx) {
         g.mark(F_BAD);
         return;
     }
@@ -695,7 +801,8 @@ fn is_key_start(b: u8) -> bool {
 }
 
 fn is_key_cont(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+    // `[` `]` for the kernel's split-argument keys (`a3[0]`).
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'[' | b']')
 }
 
 fn take_key(body: &str, start: usize) -> Result<(&str, usize), ()> {
@@ -754,38 +861,55 @@ fn scan_quoted_end(b: &[u8], start: usize) -> Result<usize, ()> {
     Err(())
 }
 
+/// Decodes an audit value (quoted, hex, or `(null)`) for exe/comm: fails if
+/// the decoded value is over `MAX_DECODED`.
 fn decode_encoded(raw: &str) -> Result<Option<String>, ()> {
+    match decode_capped(raw, MAX_DECODED)? {
+        None => Ok(None),
+        Some((bytes, full)) if full == bytes.len() => {
+            Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        }
+        Some(_) => Err(()),
+    }
+}
+
+/// Decodes an audit value keeping at most `cap` bytes. Returns the kept bytes
+/// and the full decoded length. The whole value is still validated.
+fn decode_capped(raw: &str, cap: usize) -> Result<Option<(Vec<u8>, usize)>, ()> {
     if raw == "(null)" {
         return Ok(None);
     }
     if raw.starts_with('"') {
-        return decode_quoted(raw).map(Some);
+        return decode_quoted(raw, cap).map(Some);
     }
-    decode_hex(raw).map(Some)
+    decode_hex(raw, cap).map(Some)
 }
 
-fn decode_quoted(raw: &str) -> Result<String, ()> {
+fn decode_quoted(raw: &str, cap: usize) -> Result<(Vec<u8>, usize), ()> {
     let b = raw.as_bytes();
     if b.first() != Some(&b'"') {
         return Err(());
     }
     let mut out = Vec::new();
+    let mut full = 0usize;
     let mut i = 1usize;
     while i < b.len() {
         if b[i] == b'"' {
             if i + 1 != b.len() {
                 return Err(());
             }
-            return lossy_capped(&out);
+            return Ok((out, full));
         }
+        let mut one = Vec::with_capacity(1);
         if b[i] == b'\\' {
-            i = push_escape(&mut out, b, i)?;
+            i = push_escape(&mut one, b, i)?;
         } else {
-            out.push(b[i]);
+            one.push(b[i]);
             i += 1;
         }
-        if out.len() > MAX_DECODED {
-            return Err(());
+        full += one.len();
+        if out.len() < cap {
+            out.extend_from_slice(&one);
         }
     }
     Err(())
@@ -833,27 +957,23 @@ fn oct_digit(c: u8) -> Result<u16, ()> {
     }
 }
 
-fn decode_hex(raw: &str) -> Result<String, ()> {
-    if raw.is_empty() || !raw.len().is_multiple_of(2) || raw.len() / 2 > MAX_DECODED {
+fn decode_hex(raw: &str, cap: usize) -> Result<(Vec<u8>, usize), ()> {
+    if raw.is_empty() || !raw.len().is_multiple_of(2) {
         return Err(());
     }
     let b = raw.as_bytes();
-    let mut out = Vec::with_capacity(raw.len() / 2);
+    let full = raw.len() / 2;
+    let mut out = Vec::with_capacity(full.min(cap));
     let mut i = 0;
     while i < b.len() {
         let hi = hex_val(b[i])?;
         let lo = hex_val(b[i + 1])?;
-        out.push((hi << 4) | lo);
+        if out.len() < cap {
+            out.push((hi << 4) | lo);
+        }
         i += 2;
     }
-    lossy_capped(&out)
-}
-
-fn lossy_capped(out: &[u8]) -> Result<String, ()> {
-    if out.len() > MAX_DECODED {
-        return Err(());
-    }
-    Ok(String::from_utf8_lossy(out).into_owned())
+    Ok((out, full))
 }
 
 fn hex_val(c: u8) -> Result<u8, ()> {
@@ -868,6 +988,7 @@ fn hex_val(c: u8) -> Result<u8, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nocve_proto::Severity;
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -937,6 +1058,156 @@ mod tests {
             out.push_str(&format!("{b:02X}"));
             out
         })
+    }
+
+    /// M4, reviewer probe exec 1: Debian 12 auditd defaults to
+    /// `log_format=ENRICHED`, which appends `0x1D` + interpreted fields to the
+    /// SYSCALL line (and here `key="exec"` sits right before it). That SYSCALL
+    /// line used to fail to parse, so exe/comm were lost.
+    #[test]
+    fn enriched_syscall_with_0x1d_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut s = live(root);
+        let gs = '\u{1d}';
+        let mut text = format!(
+            "type=SYSCALL msg=audit(1759300000.100:101): arch=c000003e syscall=59 success=yes exit=0 ppid=1 pid=4242 auid=0 uid=0 comm=\"kcompactd0\" exe=\"/opt/.cache/kcompactd0\" key=\"exec\"{gs}ARCH=x86_64 SYSCALL=execve AUID=\"root\" UID=\"root\"\n"
+        );
+        text.push_str("type=EXECVE msg=audit(1759300000.100:101): argc=1 a0=\"kcompactd0\"\n");
+        text.push_str("type=EOE msg=audit(1759300000.100:101): \n");
+        let evs = feed(&mut s, root, &text);
+        let ex = execs(&evs);
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].exe.as_deref(), Some("/opt/.cache/kcompactd0"));
+        assert_eq!(ex[0].pid, Some(4242));
+        let rules: Vec<&str> = evs[0].signals.iter().map(|s| s.rule.as_str()).collect();
+        assert!(rules.contains(&"proc.masquerade"), "{rules:?}");
+        assert!(!dumped(&evs).contains("AUID"));
+    }
+
+    /// M4, reviewer probe exec 2: one argument over 4 KiB (hex) used to drop
+    /// the whole exec, so a padded miner command line was invisible.
+    #[test]
+    fn overlong_argument_emits_truncated_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut s = live(root);
+        let big = "61".repeat(5000);
+        let mut text = String::from(
+            "type=SYSCALL msg=audit(1759300000.200:102): arch=c000003e syscall=59 success=yes exit=0 ppid=1 pid=4243 auid=0 uid=0 comm=\"xmrig\" exe=\"/opt/.cache/xmrig\" key=(null)\n",
+        );
+        text.push_str(&format!("type=EXECVE msg=audit(1759300000.200:102): argc=4 a0=\"xmrig\" a1=\"-o\" a2=\"stratum+tcp://pool:3333\" a3={big}\n"));
+        text.push_str("type=EOE msg=audit(1759300000.200:102): \n");
+        let evs = feed(&mut s, root, &text);
+        let ex = execs(&evs);
+        assert_eq!(ex.len(), 1, "{evs:?}");
+        assert!(ex[0].truncated);
+        assert_eq!(ex[0].argc, 4);
+        assert_eq!(ex[0].comm.as_deref(), Some("xmrig"));
+        assert!(evs[0].max_severity() == Some(Severity::Critical));
+        assert_eq!(s.health().status, CoverageStatus::Completed);
+    }
+
+    /// M4, reviewer probe exec 3: 129 arguments used to drop the exec.
+    #[test]
+    fn too_many_arguments_emits_truncated_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut s = live(root);
+        let mut args = String::new();
+        for i in 0..129 {
+            args.push_str(&format!(" a{i}=\"x\""));
+        }
+        let mut text = String::from(
+            "type=SYSCALL msg=audit(1759300000.300:103): arch=c000003e syscall=59 success=yes exit=0 ppid=1 pid=4244 auid=0 uid=0 comm=\"xmrig\" exe=\"/opt/.cache/xmrig\" key=(null)\n",
+        );
+        text.push_str(&format!(
+            "type=EXECVE msg=audit(1759300000.300:103): argc=129{args}\n"
+        ));
+        text.push_str("type=EOE msg=audit(1759300000.300:103): \n");
+        let evs = feed(&mut s, root, &text);
+        let ex = execs(&evs);
+        assert_eq!(ex.len(), 1);
+        assert!(ex[0].truncated);
+        assert_eq!(ex[0].argc, 129);
+        assert_eq!(ex[0].pid, Some(4244));
+        assert_eq!(s.health().status, CoverageStatus::Completed);
+    }
+
+    /// M4: the kernel splits a long argument into `aN_len=` + `aN[k]=` chunks,
+    /// across EXECVE records. That form used to fail to parse.
+    #[test]
+    fn split_argument_form_is_reassembled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut s = live(root);
+        let t = "1759300000.400";
+        let mut text = rec(
+            "SYSCALL",
+            t,
+            104,
+            "arch=c000003e syscall=59 success=yes exit=0 ppid=1 pid=7 auid=0 uid=0 comm=\"sh\" exe=\"/usr/bin/dash\" key=(null)",
+        );
+        let script = "echo 'root:hunter2' | chpasswd";
+        let (c0, c1) = script.split_at(10);
+        text.push_str(&rec(
+            "EXECVE",
+            t,
+            104,
+            &format!(
+                "argc=3 a0=\"sh\" a1=\"-c\" a2_len={} a2[0]={}",
+                script.len(),
+                hex_encode(c0)
+            ),
+        ));
+        text.push_str(&rec("EXECVE", t, 104, &format!("a2[1]={}", hex_encode(c1))));
+        text.push_str(&rec("EOE", t, 104, ""));
+        let evs = feed(&mut s, root, &text);
+        let ex = execs(&evs);
+        assert_eq!(ex.len(), 1, "{evs:?}");
+        assert!(!ex[0].truncated);
+        assert_eq!(ex[0].argv[..2], ["sh".to_owned(), "-c".to_owned()]);
+        assert!(ex[0].argv[2].contains("root:<masked>"), "{:?}", ex[0].argv);
+        assert!(!dumped(&evs).contains("hunter2"));
+        // A chunk longer than the declared length fails closed.
+        let mut bad = rec(
+            "SYSCALL",
+            t,
+            105,
+            "syscall=59 pid=8 comm=\"sh\" exe=\"/bin/sh\"",
+        );
+        bad.push_str(&rec("EXECVE", t, 105, "argc=1 a0_len=2 a0[0]=616263"));
+        bad.push_str(&rec("EOE", t, 105, ""));
+        assert!(execs(&feed(&mut s, root, &bad)).is_empty());
+    }
+
+    /// M4: no EXECVE record for 5 minutes means no execve rule is loaded (or
+    /// auditd stopped writing): coverage must not say completed.
+    #[test]
+    fn no_execve_records_is_partial_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut s = live(root);
+        let mut evs = Vec::new();
+        s.poll(NOW + 60_000, &mut evs);
+        assert_eq!(s.health().status, CoverageStatus::Completed);
+        append(
+            &audit_path(root),
+            &rec("USER_LOGIN", "1700000000.000", 1, "pid=1 uid=0"),
+        );
+        s.poll(NOW + EXECVE_SILENCE_MS, &mut evs);
+        assert_eq!(s.health().status, CoverageStatus::Partial);
+        assert!(
+            s.health().detail.contains("no EXECVE"),
+            "{}",
+            s.health().detail
+        );
+        append(
+            &audit_path(root),
+            &rec("EXECVE", "1700000000.500", 2, "argc=1 a0=\"ls\""),
+        );
+        s.poll(NOW + EXECVE_SILENCE_MS + 2_000, &mut evs);
+        assert_eq!(s.health().status, CoverageStatus::Completed);
     }
 
     #[test]

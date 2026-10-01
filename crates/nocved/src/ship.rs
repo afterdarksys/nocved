@@ -4,6 +4,7 @@
 //! Authorization header and is never logged.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use nocve_proto::{Coverage, Heartbeat, HeartbeatEnvelope, MacKey, Token};
@@ -19,6 +20,8 @@ pub struct Shipper {
     key: MacKey,
     host: String,
     pub fingerprint: String,
+    /// Batch size cap; lowered to isolate the event a store rejected.
+    cap: AtomicUsize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +31,14 @@ pub enum ShipOutcome {
         events: usize,
         through: u64,
     },
-    /// The store refused the batch permanently (400/409/413/422); moved aside.
+    /// The store refused a batch for one of its events; the next attempt
+    /// sends only the first `keep` envelopes so the bad one is isolated and
+    /// the good ones are not discarded with it.
+    Split {
+        status: u16,
+        keep: usize,
+    },
+    /// The store refused the envelope(s) permanently (400/409/413/422); moved aside.
     Rejected {
         status: u16,
         body: String,
@@ -42,6 +52,40 @@ pub enum ShipOutcome {
 
 fn is_loopback_http(url: &str) -> bool {
     url.starts_with("http://")
+}
+
+/// Rejection codes that are about the batch as a whole; splitting cannot help.
+const BATCH_LEVEL: &[&str] = &[
+    "stale_epoch",
+    "batch_not_contiguous",
+    "bad_batch_size",
+    "host_mismatch",
+];
+
+/// How many envelopes to send next after a rejection, or `None` to move the
+/// batch aside. The store names the offending seq (`bad_seq`) when it can:
+/// the prefix before it is resent alone, then the bad envelope alone (and only
+/// that one is moved aside). Without a seq the batch is halved (bisection).
+fn split_point(batch: &[(u64, String)], body: &str) -> Option<usize> {
+    if batch.len() <= 1 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    if v["error"]
+        .as_str()
+        .is_some_and(|c| BATCH_LEVEL.contains(&c))
+    {
+        return None;
+    }
+    let first = batch.first().map_or(0, |b| b.0);
+    let keep = match v["bad_seq"].as_u64() {
+        Some(bad) if bad > first && bad - first < batch.len() as u64 => {
+            usize::try_from(bad - first).unwrap_or(1)
+        }
+        Some(bad) if bad == first => 1,
+        _ => batch.len() / 2,
+    };
+    Some(keep.max(1))
 }
 
 impl Shipper {
@@ -67,6 +111,7 @@ impl Shipper {
             key: token.mac_key(),
             host: host.to_owned(),
             fingerprint: token.fingerprint(),
+            cap: AtomicUsize::new(nocve_proto::MAX_BATCH_EVENTS),
         }
     }
 
@@ -99,7 +144,9 @@ impl Shipper {
     pub fn ship_batch(&self, spool: &Mutex<Spool>) -> ShipOutcome {
         let batch = match spool.lock() {
             Ok(s) => s.peek(
-                nocve_proto::MAX_BATCH_EVENTS,
+                self.cap
+                    .load(Ordering::Relaxed)
+                    .clamp(1, nocve_proto::MAX_BATCH_EVENTS),
                 nocve_proto::MAX_BODY_BYTES - 64,
             ),
             Err(_) => {
@@ -122,6 +169,8 @@ impl Shipper {
         body.push_str("]}");
         match self.post("/v1/events", body.as_bytes()) {
             Ok((200, _, _)) => {
+                self.cap
+                    .store(nocve_proto::MAX_BATCH_EVENTS, Ordering::Relaxed);
                 if let Ok(mut s) = spool.lock()
                     && let Err(e) = s.ack(through)
                 {
@@ -136,6 +185,10 @@ impl Shipper {
                 }
             }
             Ok((st @ (400 | 409 | 413 | 422), text, _)) => {
+                if let Some(keep) = split_point(&batch, &text) {
+                    self.cap.store(keep, Ordering::Relaxed);
+                    return ShipOutcome::Split { status: st, keep };
+                }
                 if let Ok(mut s) = spool.lock()
                     && let Err(e) = s.reject(&batch, &text)
                 {
@@ -167,6 +220,39 @@ impl Shipper {
         }
     }
 
+    /// Builds the next heartbeat (advances the persisted counter).
+    /// `last_tick_ms` is when the main poll loop last completed (`None`
+    /// before the first tick).
+    pub fn build_heartbeat(
+        &self,
+        spool: &Mutex<Spool>,
+        coverage: Vec<Coverage>,
+        now_ms: i64,
+        boot_id: Option<String>,
+        last_tick_ms: Option<i64>,
+    ) -> Result<Heartbeat, String> {
+        let mut s = spool.lock().map_err(|_| "spool lock poisoned")?;
+        let counter = s.next_heartbeat_counter()?;
+        let feed = s.feed_skipped();
+        Ok(Heartbeat {
+            host: self.host.clone(),
+            epoch: s.chainer().epoch_hex(),
+            counter,
+            sent_at_ms: now_ms,
+            next_seq: s.chainer().next_seq(),
+            head: hex::encode(s.chainer().head()),
+            spool_events: s.len() as u64,
+            spool_bytes: s.bytes(),
+            dropped_total: s.dropped_total,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            boot_id,
+            coverage,
+            last_tick_ms,
+            feed_skipped_long: feed.map(|f| f.0),
+            feed_skipped_burst: feed.map(|f| f.1),
+        })
+    }
+
     /// Sends one heartbeat. Returns the HTTP status.
     pub fn heartbeat(
         &self,
@@ -174,25 +260,9 @@ impl Shipper {
         coverage: Vec<Coverage>,
         now_ms: i64,
         boot_id: Option<String>,
+        last_tick_ms: Option<i64>,
     ) -> Result<u16, String> {
-        let hb = {
-            let mut s = spool.lock().map_err(|_| "spool lock poisoned")?;
-            let counter = s.next_heartbeat_counter()?;
-            Heartbeat {
-                host: self.host.clone(),
-                epoch: s.chainer().epoch_hex(),
-                counter,
-                sent_at_ms: now_ms,
-                next_seq: s.chainer().next_seq(),
-                head: hex::encode(s.chainer().head()),
-                spool_events: s.len() as u64,
-                spool_bytes: s.bytes(),
-                dropped_total: s.dropped_total,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                boot_id,
-                coverage,
-            }
-        };
+        let hb = self.build_heartbeat(spool, coverage, now_ms, boot_id, last_tick_ms)?;
         let payload = serde_json::to_string(&hb).map_err(|e| e.to_string())?;
         let env = HeartbeatEnvelope::seal(&self.key, &self.host, payload);
         let body = serde_json::to_vec(&env).map_err(|e| e.to_string())?;
@@ -206,6 +276,7 @@ impl Shipper {
             match self.ship_batch(spool) {
                 ShipOutcome::Idle => return Ok(n),
                 ShipOutcome::Sent { events, .. } => n += events,
+                ShipOutcome::Split { .. } => {}
                 ShipOutcome::Rejected { status, body } => {
                     return Err(format!("rejected {status}: {body}"));
                 }

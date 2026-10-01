@@ -1,0 +1,7 @@
+## nocved: record every execve so short-lived processes reach audit.log
+## (DESIGN.md section 11). Installed to /etc/audit/rules.d/50-nocved.rules by
+## install.sh and the Ansible playbook, then loaded with `augenrules --load`.
+## Without it the auditd source reports coverage `partial` ("no EXECVE record").
+## The key only tags records; nocved does not filter on it.
+-a always,exit -F arch=b64 -S execve -k nocved_exec
+-a always,exit -F arch=b32 -S execve -k nocved_exec

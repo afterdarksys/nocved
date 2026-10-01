@@ -28,6 +28,20 @@ struct State {
     head: String,
     hb_counter: u64,
     acked_through: Option<u64>,
+    /// Fingerprint of the MAC key the chain was sealed with. A different key
+    /// (rekey) starts a new epoch: envelopes MACed with the old key can never
+    /// verify at the store.
+    #[serde(default)]
+    key_fp: Option<String>,
+}
+
+/// Non-secret fingerprint of a MAC key (state file only).
+fn key_fp(key: &MacKey) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"nocve-spool-keyfp-v1");
+    h.update(key.to_bytes());
+    hex::encode(&h.finalize()[..8])
 }
 
 pub struct Spool {
@@ -43,6 +57,8 @@ pub struct Spool {
     dropped_since_ms: i64,
     pub dropped_total: u64,
     pub new_epoch: bool,
+    feed: Option<crate::feed::Feed>,
+    feed_errors: u64,
 }
 
 impl Spool {
@@ -55,6 +71,20 @@ impl Spool {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .filter(|s: &State| s.host == host);
+        let fp = key_fp(&key);
+        let rekeyed = state
+            .as_ref()
+            .is_some_and(|s| s.key_fp.as_deref().is_some_and(|k| k != fp));
+        if rekeyed {
+            // Keep the old-key envelopes for aftercve; they are never resent.
+            let old = dir.join("spool.jsonl");
+            if old.exists() {
+                std::fs::rename(&old, dir.join("spool.rekeyed.jsonl"))
+                    .map_err(|e| format!("{}: {e}", old.display()))?;
+            }
+            eprintln!("nocved: host key changed; starting a new chain epoch");
+        }
+        let state = state.filter(|_| !rekeyed);
         let resumed = state.as_ref().and_then(|s| {
             let epoch = decode_hex::<EPOCH_BYTES>(&s.epoch, "epoch").ok()?;
             let head = decode_hex::<32>(&s.head, "head").ok()?;
@@ -111,6 +141,8 @@ impl Spool {
             dropped_since_ms: 0,
             dropped_total: 0,
             new_epoch,
+            feed: None,
+            feed_errors: 0,
         };
         s.compact().map_err(|e| format!("spool compact: {e}"))?;
         s.save_state().map_err(|e| format!("state: {e}"))?;
@@ -125,6 +157,7 @@ impl Spool {
             head: hex::encode(self.chainer.head()),
             hb_counter: self.hb_counter,
             acked_through: self.acked_through,
+            key_fp: Some(key_fp(self.chainer.key())),
         };
         let b = serde_json::to_vec(&st).map_err(std::io::Error::other)?;
         write_atomic_0600(&self.dir.join("state.json"), &b)
@@ -159,10 +192,18 @@ impl Spool {
         if payload.len() > nocve_proto::MAX_PAYLOAD_BYTES {
             return Err("event payload too large".into());
         }
-        let env = self.chainer.seal(payload);
+        // Seal on a copy and commit the chain state only after the append
+        // succeeded: a failed write must not advance seq/head (that would be a
+        // gap the sensor made itself).
+        let mut next = self.chainer.clone();
+        let env = next.seal(payload);
         let line = serde_json::to_string(&env).map_err(|e| e.to_string())?;
         self.append(&line)
             .map_err(|e| format!("spool append: {e}"))?;
+        self.chainer = next;
+        if let Some(f) = self.feed.as_mut() {
+            crate::feed::append_logged(f, &line, &mut self.feed_errors);
+        }
         self.queue_bytes += line.len() as u64 + 1;
         self.queue.push_back((env.seq, line));
         Ok(())
@@ -283,6 +324,17 @@ impl Spool {
         }
     }
 
+    /// Mirrors every newly spooled envelope line into a read-only feed.
+    pub fn set_feed(&mut self, feed: crate::feed::Feed) {
+        self.feed = Some(feed);
+    }
+
+    /// Feed lines skipped `(too long, burst)`, or `None` without a feed.
+    #[must_use]
+    pub fn feed_skipped(&self) -> Option<(u64, u64)> {
+        self.feed.as_ref().map(crate::feed::Feed::skipped)
+    }
+
     pub fn next_heartbeat_counter(&mut self) -> Result<u64, String> {
         self.hb_counter += 1;
         self.save_state().map_err(|e| e.to_string())?;
@@ -398,6 +450,70 @@ mod tests {
         assert!(
             s.push(&ev(i, Some(Severity::Critical))),
             "high severity uses the reserve"
+        );
+    }
+
+    /// LOW-1: a failed append used to advance the chain anyway (self-made gap).
+    #[test]
+    fn failed_append_does_not_advance_the_chain() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(d.path(), "h", key(), 1 << 20).unwrap();
+        assert!(s.push(&ev(1, None)));
+        let before = s.chainer().next_seq();
+        let head = s.chainer().head();
+        let spool = d.path().join("spool.jsonl");
+        std::fs::remove_file(&spool).unwrap();
+        std::fs::create_dir(&spool).unwrap();
+        assert!(!s.push(&ev(2, None)), "append into a directory fails");
+        assert_eq!(s.chainer().next_seq(), before);
+        assert_eq!(s.chainer().head(), head);
+        std::fs::remove_dir(&spool).unwrap();
+        assert!(s.push(&ev(3, None)));
+        let seqs: Vec<u64> = s.peek(100, usize::MAX).iter().map(|x| x.0).collect();
+        assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
+    }
+
+    /// LOW-2: a new host key starts a new epoch instead of resending
+    /// envelopes MACed with the old key.
+    #[test]
+    fn rekey_starts_new_epoch_and_keeps_old_spool_aside() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(d.path(), "h", key(), 1 << 20).unwrap();
+        s.push(&ev(1, None));
+        s.flush().unwrap();
+        let e1 = s.chainer().epoch_hex();
+        drop(s);
+        let same = Spool::open(d.path(), "h", key(), 1 << 20).unwrap();
+        assert!(!same.new_epoch);
+        drop(same);
+        let s2 = Spool::open(d.path(), "h", MacKey::derive(&[9; 32]), 1 << 20).unwrap();
+        assert!(s2.new_epoch);
+        assert_ne!(s2.chainer().epoch_hex(), e1);
+        assert!(s2.is_empty());
+        assert!(d.path().join("spool.rekeyed.jsonl").exists());
+    }
+
+    /// cveguard feed: every spooled envelope line is mirrored unchanged.
+    #[test]
+    fn feed_mirrors_spooled_envelopes() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(&d.path().join("state"), "h", key(), 1 << 20).unwrap();
+        let cfg = crate::feed::FeedConfig {
+            enabled: true,
+            dir: d.path().join("feed"),
+            group: None,
+            max_bytes: 1 << 20,
+        };
+        s.set_feed(crate::feed::Feed::open(&cfg, None).unwrap());
+        for i in 0..3 {
+            assert!(s.push(&ev(i, None)));
+        }
+        let spooled: Vec<String> = s.peek(10, usize::MAX).into_iter().map(|x| x.1).collect();
+        let fed = std::fs::read_to_string(cfg.dir.join(crate::feed::FEED_FILE)).unwrap();
+        assert_eq!(fed.lines().collect::<Vec<_>>(), spooled);
+        assert!(
+            !fed.contains(&hex::encode(key().to_bytes())),
+            "never the MAC key"
         );
     }
 

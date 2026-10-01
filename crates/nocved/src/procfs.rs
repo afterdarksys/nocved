@@ -21,8 +21,18 @@ pub struct Stat {
 
 impl Stat {
     #[must_use]
+    /// Kernel threads carry PF_KTHREAD (or are kthreadd, pid 2). The parent
+    /// pid is NOT evidence: a user process reparented to or claiming pid 2
+    /// must still be seen (see `claims_kthreadd_parent`).
     pub fn is_kernel_thread(&self) -> bool {
-        self.flags & PF_KTHREAD != 0 || self.ppid == 2 || self.pid == 2
+        self.flags & PF_KTHREAD != 0 || self.pid == 2
+    }
+
+    /// A child of kthreadd that is not a kernel thread: a user process hiding
+    /// among kernel workers.
+    #[must_use]
+    pub fn claims_kthreadd_parent(&self) -> bool {
+        self.ppid == 2 && !self.is_kernel_thread()
     }
     #[must_use]
     pub fn cpu_ticks(&self) -> u64 {
@@ -274,6 +284,15 @@ mod tests {
         assert!(!st.is_kernel_thread());
         assert!(parse_stat(b"garbage").is_none());
         assert!(parse_stat(b"12 (x) S").is_none());
+    }
+
+    /// M8: ppid 2 alone used to hide a process completely.
+    #[test]
+    fn ppid_2_without_pf_kthread_is_not_a_kernel_thread() {
+        let s = b"4242 (kworker/0:2) S 2 0 0 0 -1 4194560 0 0 0 0 0 1 0 0 20 0 1 0 60 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n";
+        let st = parse_stat(s).unwrap_or_else(|| unreachable!());
+        assert!(!st.is_kernel_thread());
+        assert!(st.claims_kthreadd_parent());
     }
 
     #[test]

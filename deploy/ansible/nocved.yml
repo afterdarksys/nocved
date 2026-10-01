@@ -133,6 +133,27 @@
           changed_when: false
           when: not ansible_check_mode
 
+        - name: Look for auditd
+          ansible.builtin.stat:
+            path: /etc/audit/rules.d
+          register: nv_auditd
+
+        - name: Install the execve audit rule (auditd source coverage)
+          ansible.builtin.copy:
+            src: "{{ nocved_repo }}/deploy/audit/nocved.rules"
+            dest: /etc/audit/rules.d/50-nocved.rules
+            owner: root
+            group: root
+            mode: "0640"
+          register: nv_audit_rule
+          when: nv_auditd.stat.isdir | default(false)
+
+        - name: Load audit rules
+          ansible.builtin.command:
+            argv: [augenrules, --load]
+          when: nv_audit_rule is changed
+          changed_when: true
+
         - name: Install the systemd unit
           ansible.builtin.copy:
             src: "{{ nocved_repo }}/deploy/nocved.service"

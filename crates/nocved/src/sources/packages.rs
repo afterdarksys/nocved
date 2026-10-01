@@ -10,8 +10,10 @@ use std::time::Duration;
 use nocve_proto::mask::mask_line;
 use nocve_proto::{Coverage, CoverageStatus, Event, EventData, Indicators, Severity, Signal};
 
-use super::tail::{Anomaly, Tailer};
-use super::{Ctx, MAX_EVENTS_PER_POLL, Source, cap_events, coverage};
+use super::tail::Tailer;
+use super::{
+    Ctx, LAG_PARTIAL_BYTES, MAX_EVENTS_PER_POLL, Source, cap_events, coverage, tail_events,
+};
 use crate::config::SourceToggle;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,10 +220,13 @@ impl Source for PackagesSource {
     fn poll(&mut self, now_ms: i64, out: &mut Vec<Event>) {
         let mut evs = Vec::new();
         let dpkg = self.dpkg.poll();
-        push_log_anomalies(
+        let mut lag = dpkg.lag_bytes;
+        tail_events(
+            "packages",
+            "pkglog",
             now_ms,
             &shown_path(&self.ctx, self.dpkg.path()),
-            &dpkg.anomalies,
+            &dpkg,
             &mut evs,
         );
         for line in dpkg.lines {
@@ -259,10 +264,13 @@ impl Source for PackagesSource {
             );
         }
         let apt = self.apt.poll();
-        push_log_anomalies(
+        lag += apt.lag_bytes;
+        tail_events(
+            "packages",
+            "pkglog",
             now_ms,
             &shown_path(&self.ctx, self.apt.path()),
-            &apt.anomalies,
+            &apt,
             &mut evs,
         );
         for line in apt.lines {
@@ -287,6 +295,11 @@ impl Source for PackagesSource {
         }
         cap_events("packages", now_ms, evs, MAX_EVENTS_PER_POLL, out);
         self.health = match (self.dpkg.is_open(), self.apt.is_open()) {
+            (true, true) if lag > LAG_PARTIAL_BYTES => coverage(
+                "packages",
+                CoverageStatus::Partial,
+                format!("dpkg.log + apt history.log; {lag} bytes behind"),
+            ),
             (true, true) => coverage(
                 "packages",
                 CoverageStatus::Completed,
@@ -315,47 +328,6 @@ fn shown_path(ctx: &Ctx, path: &std::path::Path) -> String {
         |_| path.display().to_string(),
         |p| format!("/{}", p.display()),
     )
-}
-
-fn push_log_anomalies(now_ms: i64, path: &str, anomalies: &[Anomaly], evs: &mut Vec<Event>) {
-    for anomaly in anomalies {
-        let (rule, reason, detail) = match anomaly {
-            Anomaly::Truncated { from, to } => (
-                "pkglog.truncated",
-                "truncated",
-                format!("{path} shrank from {from} to {to} bytes"),
-            ),
-            Anomaly::Replaced {
-                old_inode,
-                new_inode,
-                old_unlinked,
-            } => (
-                "pkglog.replaced",
-                "replaced",
-                format!(
-                    "{path} replaced in place (inode {old_inode} -> {new_inode}, old unlinked: {old_unlinked}); typical of sed -i"
-                ),
-            ),
-            Anomaly::Deleted => ("pkglog.deleted", "deleted", format!("{path} was deleted")),
-            Anomaly::Symlink => (
-                "pkglog.symlink",
-                "symlink",
-                format!("{path} is now a symlink (not followed)"),
-            ),
-        };
-        evs.push(
-            Event::new(
-                now_ms,
-                "packages",
-                EventData::LogTamper {
-                    path: path.to_owned(),
-                    reason: reason.to_owned(),
-                    detail: detail.clone(),
-                },
-            )
-            .with_signals(vec![Signal::new(rule, Severity::High, detail)]),
-        );
-    }
 }
 
 #[cfg(test)]

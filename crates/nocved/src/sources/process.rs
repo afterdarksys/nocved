@@ -240,7 +240,17 @@ impl Source for ProcessSource {
                     evs.push(exit_event(now_ms, pid, &old));
                 }
                 let (info, argv) = self.read_info(pid, &st);
-                let signals = process_signals(&self.ctx.ind, &info, &argv);
+                let mut signals = process_signals(&self.ctx.ind, &info, &argv);
+                if st.claims_kthreadd_parent() {
+                    signals.push(Signal::new(
+                        "proc.fake_kthread",
+                        Severity::High,
+                        format!(
+                            "'{}' has kthreadd (pid 2) as parent but is not a kernel thread",
+                            info.name
+                        ),
+                    ));
+                }
                 let suspicious_exe = signals.iter().any(|s| {
                     matches!(
                         s.rule.as_str(),
@@ -484,6 +494,36 @@ mod tests {
         s.poll(0, &mut out);
         assert_eq!(out.len(), 1);
         assert!(out[0].signals.is_empty());
+    }
+
+    /// M8: a user process with ppid 2 used to be skipped as a kernel thread.
+    #[test]
+    fn user_process_under_kthreadd_is_reported_high() {
+        let d = tempfile::tempdir().unwrap();
+        let fp = FakeProc::new(d.path());
+        fp.add(
+            4242,
+            2,
+            0,
+            "kworker/0:2",
+            "/usr/bin/python3",
+            &["kworker/0:2"],
+            10,
+            0,
+        );
+        fp.add_kthread(45, "kworker/0:1");
+        let mut s = ProcessSource::new(ctx(d.path()), ProcessConfig::default());
+        let mut out = Vec::new();
+        s.poll(0, &mut out);
+        assert_eq!(out.len(), 1, "the real kernel thread stays quiet");
+        assert!(
+            out[0]
+                .signals
+                .iter()
+                .any(|s| s.rule == "proc.fake_kthread" && s.severity == Severity::High),
+            "{:?}",
+            out[0].signals
+        );
     }
 
     #[test]

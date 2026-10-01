@@ -12,5 +12,6 @@
     "packages": { "enabled": true, "interval_secs": 5 },
     "persistence": { "enabled": true, "interval_secs": 30 },
     "auditd": { "enabled": true, "interval_secs": 2 }
-  }
+  },
+  "feed": { "enabled": false, "dir": "/var/lib/nocved/cveguard-feed", "group": "cveguard", "max_bytes": 4194304 }
 }

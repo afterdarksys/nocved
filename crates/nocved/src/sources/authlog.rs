@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use nocve_proto::{Coverage, CoverageStatus, Event, EventData, Severity, Signal, SshAuthInfo};
 
-use super::tail::{Anomaly, Tailer};
-use super::{Ctx, MAX_EVENTS_PER_POLL, Source, cap_events, coverage};
+use super::tail::Tailer;
+use super::{
+    Ctx, LAG_PARTIAL_BYTES, MAX_EVENTS_PER_POLL, Source, cap_events, coverage, tail_events,
+};
 use crate::config::AuthlogConfig;
 use crate::fsutil::read_prefix;
 use crate::procfs;
@@ -169,6 +171,24 @@ impl AuthlogSource {
         }
     }
 
+    /// M6: the pid in an `sshd[PID]` tag is attacker-chosen when the line came
+    /// from `logger`. A line is verified only if that pid is a live process
+    /// whose `/proc/PID/exe` is an sshd binary (`sshd`, `sshd-session`,
+    /// `sshd-auth`). This does NOT stop an attacker who names the pid of a
+    /// real, live sshd; it stops arbitrary pids and dead ones.
+    fn sshd_pid_verified(&self, pid: Option<u32>) -> bool {
+        let Some(pid) = pid else {
+            return false;
+        };
+        procfs::readlink_string(&self.ctx.path("/proc").join(pid.to_string()).join("exe"))
+            .is_some_and(|t| {
+                let (exe, _) = procfs::split_deleted(&t);
+                exe.rsplit('/')
+                    .next()
+                    .is_some_and(|b| b == "sshd" || b.starts_with("sshd-"))
+            })
+    }
+
     fn live_ssh_sessions(&self) -> usize {
         let proc_dir = self.ctx.path("/proc");
         procfs::list_pids(&proc_dir, 65_536)
@@ -206,6 +226,7 @@ impl AuthlogSource {
                 "line was written to an auth log inode that had been removed from view",
             ));
         }
+        let verified = self.sshd_pid_verified(l.pid);
         match m {
             SshdMsg::Auth {
                 accepted,
@@ -246,7 +267,8 @@ impl AuthlogSource {
                             format!("password accepted on the first try from {ip}: the credential was known"),
                         ));
                     }
-                } else {
+                } else if verified {
+                    // Unverified failures never suppress `ssh.password_first_try`.
                     if self.failed_order.len() >= TRACK_CAP
                         && let Some(o) = self.failed_order.pop_front()
                     {
@@ -271,6 +293,7 @@ impl AuthlogSource {
                             log_time: l.time,
                             log_host: l.host,
                             path: path.to_owned(),
+                            unverified: !verified,
                         }),
                     )
                     .with_signals(signals),
@@ -341,6 +364,7 @@ impl Source for AuthlogSource {
         let mut evs = Vec::new();
         let mut got_line = false;
         let mut open = Vec::new();
+        let mut lag = 0u64;
         let mut tailers = std::mem::take(&mut self.tailers);
         for t in &mut tailers {
             let o = t.poll();
@@ -348,45 +372,8 @@ impl Source for AuthlogSource {
                 |_| t.path().display().to_string(),
                 |p| format!("/{}", p.display()),
             );
-            for a in &o.anomalies {
-                let ev = match a {
-                    Anomaly::Truncated { from, to } => tamper(
-                        now_ms,
-                        &shown,
-                        "authlog.truncated",
-                        "truncated",
-                        format!("{shown} shrank from {from} to {to} bytes"),
-                    ),
-                    Anomaly::Replaced {
-                        old_inode,
-                        new_inode,
-                        old_unlinked,
-                    } => tamper(
-                        now_ms,
-                        &shown,
-                        "authlog.replaced",
-                        "replaced",
-                        format!(
-                            "{shown} replaced in place (inode {old_inode} -> {new_inode}, old unlinked: {old_unlinked}); typical of sed -i"
-                        ),
-                    ),
-                    Anomaly::Deleted => tamper(
-                        now_ms,
-                        &shown,
-                        "authlog.deleted",
-                        "deleted",
-                        format!("{shown} was deleted"),
-                    ),
-                    Anomaly::Symlink => tamper(
-                        now_ms,
-                        &shown,
-                        "authlog.symlink",
-                        "symlink",
-                        format!("{shown} is now a symlink (not followed)"),
-                    ),
-                };
-                evs.push(ev);
-            }
+            tail_events("authlog", "authlog", now_ms, &shown, &o, &mut evs);
+            lag += o.lag_bytes;
             got_line |= !o.lines.is_empty();
             for (i, line) in o.lines.iter().enumerate() {
                 self.handle_line(now_ms, &shown, line, i < o.orphan_lines, &mut evs);
@@ -428,6 +415,12 @@ impl Source for AuthlogSource {
                 "authlog",
                 CoverageStatus::Unsupported,
                 "no auth.log or secure (journald-only host?)",
+            )
+        } else if lag > LAG_PARTIAL_BYTES {
+            coverage(
+                "authlog",
+                CoverageStatus::Partial,
+                format!("tailing {}; {lag} bytes behind", open.join(", ")),
             )
         } else {
             coverage(
@@ -526,6 +519,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("var/log/auth.log");
         append(&p, b"");
+        let fp = crate::testutil::FakeProc::new(d.path());
+        for pid in [100, 101, 102] {
+            fp.add(
+                pid,
+                900,
+                0,
+                "sshd",
+                "/usr/sbin/sshd",
+                &["sshd: root [priv]"],
+                10,
+                0,
+            );
+        }
         let mut s = src(d.path());
         let mut out = Vec::new();
         s.poll(0, &mut out);
@@ -551,6 +557,52 @@ mod tests {
             vec!["ssh.root_password_login", "ssh.password_first_try"]
         );
         assert_eq!(rules[4], vec!["authlog.orphan_session"]);
+    }
+
+    fn auth_info(e: &Event) -> &SshAuthInfo {
+        match &e.data {
+            EventData::SshAuth(a) => a,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// M6: `logger -t 'sshd[4242]' 'Failed password ...'` must not suppress
+    /// `ssh.password_first_try` for the real login that follows, and the
+    /// injected line is marked unverified.
+    #[test]
+    fn injected_failure_line_does_not_suppress_first_try() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("var/log/auth.log");
+        append(&p, b"");
+        let fp = crate::testutil::FakeProc::new(d.path());
+        // 4242 is a live process, but not sshd (the attacker's shell).
+        fp.add(4242, 1, 0, "bash", "/usr/bin/bash", &["bash"], 10, 0);
+        fp.add(
+            501,
+            900,
+            0,
+            "sshd",
+            "/usr/sbin/sshd",
+            &["sshd: root [priv]"],
+            10,
+            0,
+        );
+        let mut s = src(d.path());
+        let mut out = Vec::new();
+        s.poll(0, &mut out);
+        append(&p, b"Sep 20 19:18:40 gdns2 sshd[4242]: Failed password for root from 185.121.108.3 port 1 ssh2\n");
+        append(&p, b"Sep 20 19:18:41 gdns2 sshd[999]: Failed password for root from 185.121.108.3 port 1 ssh2\n");
+        append(&p, b"Sep 20 19:18:45 gdns2 sshd[501]: Accepted password for root from 185.121.108.3 port 2 ssh2\n");
+        s.poll(10_000, &mut out);
+        assert_eq!(out.len(), 3);
+        assert!(auth_info(&out[0]).unverified, "pid is not sshd");
+        assert!(auth_info(&out[1]).unverified, "pid is not live");
+        assert!(!auth_info(&out[2]).unverified);
+        let rules: Vec<&str> = out[2].signals.iter().map(|s| s.rule.as_str()).collect();
+        assert_eq!(
+            rules,
+            vec!["ssh.root_password_login", "ssh.password_first_try"]
+        );
     }
 
     #[test]

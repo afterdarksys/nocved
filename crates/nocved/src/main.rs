@@ -51,6 +51,14 @@ fn check(cfg: &Config) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    // The release profile unwinds (the store needs catch_unwind). The sensor
+    // keeps abort-on-panic: a panicking shipper thread must not leave a
+    // half-alive sensor; systemd restarts it (Restart=always) and the store
+    // sees the restart in the heartbeat/boot data.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("nocved: fatal: {info}");
+        std::process::abort();
+    }));
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("version") => {

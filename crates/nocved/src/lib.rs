@@ -2,7 +2,9 @@
 
 pub mod config;
 pub mod daemon;
+pub mod feed;
 pub mod fsutil;
+pub mod notify;
 pub mod procfs;
 pub mod ship;
 pub mod sources;

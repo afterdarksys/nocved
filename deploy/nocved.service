@@ -10,7 +10,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# notify + watchdog: nocved sends READY=1 once started and WATCHDOG=1 from the
+# main poll loop (not the shipper thread). A poll loop stuck for 60 s (FIFO,
+# hung read) is killed and restarted even though heartbeats would continue;
+# the store also raises sensor.stalled from the heartbeat's last_tick_ms.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 ExecStart=/usr/local/bin/nocved run --config /etc/nocved/config.json
 Restart=always
 RestartSec=5
@@ -20,6 +26,9 @@ AmbientCapabilities=
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/nocved
+# Optional cveguard feed (config "feed": {"enabled": true, "group": "cveguard"}):
+# nocved has no CAP_CHOWN, so it must be a member of the feed group to set it.
+#SupplementaryGroups=cveguard
 StateDirectory=nocved
 StateDirectoryMode=0700
 ProtectHome=read-only
@@ -46,7 +55,10 @@ UMask=0077
 MemoryMax=128M
 CPUQuota=5%
 Nice=10
-IOSchedulingClass=idle
+# best-effort/7, not idle: the idle class can starve the sensor indefinitely
+# under sustained I/O (an attacker can generate that load on purpose).
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 [Install]
 WantedBy=multi-user.target

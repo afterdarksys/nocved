@@ -7,7 +7,7 @@
 //! UDP listeners are not events. Miner-pool rules apply only to connections.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use nocve_proto::{Coverage, CoverageStatus, Event, EventData, NetConnInfo, Severity, Signal};
@@ -270,7 +270,9 @@ impl Source for NetSource {
                     "net",
                     EventData::NetConnect(NetConnInfo {
                         proto: s.proto.to_owned(),
-                        local: format!("{}:{}", s.local, s.local_port),
+                        local: SocketAddr::new(s.local, s.local_port).to_string(),
+                        local_ip: Some(s.local.to_string()),
+                        local_port: Some(s.local_port),
                         remote_ip: s.remote.to_string(),
                         remote_port: s.remote_port,
                         state: procfs::tcp_state_name(s.state).to_owned(),
@@ -310,7 +312,9 @@ impl Source for NetSource {
                         "net",
                         EventData::NetListen(NetConnInfo {
                             proto: s.proto.to_owned(),
-                            local: format!("{}:{}", s.local, s.local_port),
+                            local: SocketAddr::new(s.local, s.local_port).to_string(),
+                            local_ip: Some(s.local.to_string()),
+                            local_port: Some(s.local_port),
                             remote_ip: s.remote.to_string(),
                             remote_port: s.remote_port,
                             state: procfs::tcp_state_name(s.state).to_owned(),
@@ -323,7 +327,11 @@ impl Source for NetSource {
                     .with_signals(vec![Signal::new(
                         "net.listen",
                         Severity::Medium,
-                        format!("{} listening on {}:{}", s.proto, s.local, s.local_port),
+                        format!(
+                            "{} listening on {}",
+                            s.proto,
+                            SocketAddr::new(s.local, s.local_port)
+                        ),
                     )]),
                 );
             }
@@ -482,6 +490,8 @@ mod tests {
         };
         assert_eq!(c.proto, "tcp");
         assert_eq!(c.local, "0.0.0.0:4444");
+        assert_eq!(c.local_ip.as_deref(), Some("0.0.0.0"));
+        assert_eq!(c.local_port, Some(4444));
         assert_eq!(c.state, "listen");
         assert_eq!(c.pid, Some(42));
         assert_eq!(c.exe.as_deref(), Some("/usr/sbin/sshd"));
@@ -494,5 +504,55 @@ mod tests {
         );
         s.poll(40_000, &mut out);
         assert_eq!(out.iter().filter(|e| e.kind() == "net.listen").count(), 1);
+    }
+
+    /// B15 (cross-repo e2e): IPv6 local addresses were emitted as
+    /// `::1:9998`, which cannot be split. Now `local` is `[::1]:9998` and
+    /// `local_ip`/`local_port` are separate fields.
+    #[test]
+    fn ipv6_listener_local_is_bracketed_and_split() {
+        let d = tempfile::tempdir().unwrap();
+        let fp = FakeProc::new(d.path());
+        let ctx = Ctx {
+            root: d.path().to_path_buf(),
+            ind: Arc::new(nocve_proto::Indicators::builtin().unwrap()),
+        };
+        let mut s = NetSource::new(ctx, NetConfig::default());
+        let mut out = Vec::new();
+        fp.add(42, 1, 0, "svc", "/usr/bin/svc", &["svc"], 1, 0);
+        fp.add_socket(42, 3, 100);
+        fp.set_net(
+            42,
+            "tcp",
+            &[FakeProc::tcp_row(
+                [0, 0, 0, 0],
+                22,
+                [0, 0, 0, 0],
+                0,
+                procfs::TCP_LISTEN,
+                100,
+            )],
+        );
+        s.poll(0, &mut out);
+        assert!(out.iter().all(|e| e.kind() != "net.listen"));
+        fp.add_socket(42, 4, 200);
+        // ::1 port 9998 (0x270E), LISTEN, as /proc/net/tcp6 prints it.
+        fp.set_net(
+            42,
+            "tcp6",
+            &["   0: 00000000000000000000000001000000:270E 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 200 1 0000000000000000 20 4 30 10 -1".to_owned()],
+        );
+        s.poll(20_000, &mut out);
+        let ev = out.iter().find(|e| e.kind() == "net.listen").unwrap();
+        let EventData::NetListen(c) = &ev.data else {
+            panic!("kind");
+        };
+        assert_eq!(c.local, "[::1]:9998");
+        assert_eq!(c.local_ip.as_deref(), Some("::1"));
+        assert_eq!(c.local_port, Some(9998));
+        assert_eq!(ev.signals[0].summary, "tcp6 listening on [::1]:9998");
+        let json = serde_json::to_value(c).unwrap();
+        assert_eq!(json["local_ip"], "::1");
+        assert_eq!(json["local_port"], 9998);
     }
 }

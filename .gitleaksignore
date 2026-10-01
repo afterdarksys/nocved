@@ -1,0 +1,3 @@
+# Reviewed false positives: test fixtures proving secret masking, not credentials.
+crates/nocve-proto/src/mask.rs:curl-auth-user:604
+crates/nocve-proto/src/mask.rs:curl-auth-user:648
