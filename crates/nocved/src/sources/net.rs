@@ -1,5 +1,10 @@
 //! New outbound connections to public destinations, per network namespace,
 //! with pid attribution via the /proc/*/fd socket inode map. Resolves nothing.
+//!
+//! TCP listeners are sampled the same way. The first successful read of the
+//! namespace is silent, so a host that is already listening does not flood
+//! the chain. A listener that appears later is one `net.listen` event.
+//! UDP listeners are not events. Miner-pool rules apply only to connections.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -14,6 +19,7 @@ use crate::procfs::{self, Sock};
 
 const DEDUPE_CAP: usize = 16_384;
 const DEDUPE_TTL_MS: i64 = 3_600_000;
+const LISTEN_CAP: usize = 16_384;
 const INODE_SCAN_MIN_MS: i64 = 10_000;
 const MAX_FDS_SCANNED: usize = 1_000_000;
 const MAX_SOCKS_PER_TABLE: usize = 65_536;
@@ -25,6 +31,11 @@ pub struct NetSource {
     seen_dest: HashMap<(String, IpAddr, u16), i64>,
     dest_order: VecDeque<(String, IpAddr, u16)>,
     handled_inodes: HashSet<u64>,
+    /// (netns, proto, local ip, local port) already sampled. No eviction:
+    /// a full set is partial coverage, and the overflow is not emitted.
+    listen_seen: HashSet<(String, String, String, u16)>,
+    listen_baselined: bool,
+    listen_capped: bool,
     inode_pid: HashMap<u64, u32>,
     last_scan_ms: Option<i64>,
     health: Coverage,
@@ -39,6 +50,9 @@ impl NetSource {
             seen_dest: HashMap::new(),
             dest_order: VecDeque::new(),
             handled_inodes: HashSet::new(),
+            listen_seen: HashSet::new(),
+            listen_baselined: false,
+            listen_capped: false,
             inode_pid: HashMap::new(),
             last_scan_ms: None,
             health: coverage("net", CoverageStatus::Skipped, "not polled yet"),
@@ -104,6 +118,22 @@ impl NetSource {
         self.dest_order.push_back(key);
         true
     }
+
+    fn exe_for(&self, pid: Option<u32>) -> Option<String> {
+        pid.and_then(|p| {
+            procfs::readlink_string(&self.ctx.path("/proc").join(p.to_string()).join("exe"))
+                .map(|t| procfs::split_deleted(&t).0)
+        })
+    }
+}
+
+fn listen_key(ns: &Option<String>, sock: &Sock) -> (String, String, String, u16) {
+    (
+        ns.clone().unwrap_or_default(),
+        sock.proto.to_owned(),
+        sock.local.to_string(),
+        sock.local_port,
+    )
 }
 
 #[must_use]
@@ -149,6 +179,7 @@ impl Source for NetSource {
             return;
         }
         let mut candidates: Vec<(Option<String>, Sock)> = Vec::new();
+        let mut listens: Vec<(Option<String>, Sock)> = Vec::new();
         let mut tables = 0usize;
         let nss = self.namespaces();
         for (ns, dir) in &nss {
@@ -165,6 +196,7 @@ impl Source for NetSource {
                     for s in procfs::parse_net(&b, proto, v6, MAX_SOCKS_PER_TABLE) {
                         if s.proto.starts_with("tcp") && s.state == procfs::TCP_LISTEN {
                             listening.insert(s.local_port);
+                            listens.push((ns.clone(), s));
                         } else {
                             socks.push(s);
                         }
@@ -198,9 +230,15 @@ impl Source for NetSource {
             );
             return;
         }
-        let unresolved = candidates
-            .iter()
-            .any(|(_, s)| !self.inode_pid.contains_key(&s.inode));
+        let new_listen = self.listen_baselined
+            && listens.iter().any(|(ns, s)| {
+                !self.listen_seen.contains(&listen_key(ns, s))
+                    && !self.inode_pid.contains_key(&s.inode)
+            });
+        let unresolved = new_listen
+            || candidates
+                .iter()
+                .any(|(_, s)| !self.inode_pid.contains_key(&s.inode));
         if unresolved
             && self
                 .last_scan_ms
@@ -216,10 +254,7 @@ impl Source for NetSource {
             }
             self.handled_inodes.insert(s.inode);
             let pid = self.inode_pid.get(&s.inode).copied();
-            let exe = pid.and_then(|p| {
-                procfs::readlink_string(&self.ctx.path("/proc").join(p.to_string()).join("exe"))
-                    .map(|t| procfs::split_deleted(&t).0)
-            });
+            let exe = self.exe_for(pid);
             let key = (
                 exe.clone().unwrap_or_else(|| "?".into()),
                 s.remote,
@@ -248,12 +283,65 @@ impl Source for NetSource {
                 .with_signals(signals),
             );
         }
+        if !self.listen_baselined {
+            for (ns, s) in &listens {
+                if self.listen_seen.len() >= LISTEN_CAP {
+                    self.listen_capped = true;
+                    break;
+                }
+                self.listen_seen.insert(listen_key(ns, s));
+            }
+            self.listen_baselined = true;
+        } else {
+            for (ns, s) in listens {
+                let key = listen_key(&ns, &s);
+                if self.listen_seen.contains(&key) {
+                    continue;
+                }
+                if self.listen_seen.len() >= LISTEN_CAP {
+                    self.listen_capped = true;
+                    continue;
+                }
+                self.listen_seen.insert(key);
+                let pid = self.inode_pid.get(&s.inode).copied();
+                evs.push(
+                    Event::new(
+                        now_ms,
+                        "net",
+                        EventData::NetListen(NetConnInfo {
+                            proto: s.proto.to_owned(),
+                            local: format!("{}:{}", s.local, s.local_port),
+                            remote_ip: s.remote.to_string(),
+                            remote_port: s.remote_port,
+                            state: procfs::tcp_state_name(s.state).to_owned(),
+                            pid,
+                            exe: self.exe_for(pid),
+                            netns: ns,
+                            inode: s.inode,
+                        }),
+                    )
+                    .with_signals(vec![Signal::new(
+                        "net.listen",
+                        Severity::Medium,
+                        format!("{} listening on {}:{}", s.proto, s.local, s.local_port),
+                    )]),
+                );
+            }
+        }
         cap_events("net", now_ms, evs, MAX_EVENTS_PER_POLL, out);
-        self.health = coverage(
-            "net",
-            CoverageStatus::Completed,
-            format!("{} network namespace(s)", nss.len()),
-        );
+        self.health = if self.listen_capped {
+            coverage(
+                "net",
+                CoverageStatus::Partial,
+                format!("{} network namespace(s); listen table full", nss.len()),
+            )
+        } else {
+            coverage(
+                "net",
+                CoverageStatus::Completed,
+                format!("{} network namespace(s)", nss.len()),
+            )
+        };
     }
 
     fn health(&self) -> Coverage {
@@ -328,5 +416,83 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].severity, Severity::High);
         assert!(net_signals(&ind, "1.1.1.1".parse().unwrap(), 443).is_empty());
+    }
+
+    #[test]
+    fn tcp_listen_baseline_is_silent_then_a_new_listener_emits_once() {
+        let d = tempfile::tempdir().unwrap();
+        let fp = FakeProc::new(d.path());
+        let ctx = Ctx {
+            root: d.path().to_path_buf(),
+            ind: Arc::new(nocve_proto::Indicators::builtin().unwrap()),
+        };
+        let mut s = NetSource::new(ctx, NetConfig::default());
+        let mut out = Vec::new();
+        s.poll(0, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(s.health().status, CoverageStatus::Failed);
+
+        fp.add(42, 1, 0, "sshd", "/usr/sbin/sshd", &["sshd"], 1, 0);
+        fp.add_socket(42, 3, 100);
+        fp.set_net(
+            42,
+            "tcp",
+            &[FakeProc::tcp_row(
+                [0, 0, 0, 0],
+                22,
+                [0, 0, 0, 0],
+                0,
+                procfs::TCP_LISTEN,
+                100,
+            )],
+        );
+        fp.set_net(
+            42,
+            "udp",
+            &[FakeProc::tcp_row(
+                [0, 0, 0, 0],
+                53,
+                [0, 0, 0, 0],
+                0,
+                0x07,
+                300,
+            )],
+        );
+        s.poll(1_000, &mut out);
+        assert!(
+            out.iter().all(|e| e.kind() != "net.listen"),
+            "first successful sample records listeners and emits none: {out:?}"
+        );
+        assert_eq!(s.health().status, CoverageStatus::Completed);
+
+        fp.add_socket(42, 4, 200);
+        fp.set_net(
+            42,
+            "tcp",
+            &[
+                FakeProc::tcp_row([0, 0, 0, 0], 22, [0, 0, 0, 0], 0, procfs::TCP_LISTEN, 100),
+                FakeProc::tcp_row([0, 0, 0, 0], 4444, [0, 0, 0, 0], 0, procfs::TCP_LISTEN, 200),
+            ],
+        );
+        s.poll(20_000, &mut out);
+        let listens: Vec<&Event> = out.iter().filter(|e| e.kind() == "net.listen").collect();
+        assert_eq!(listens.len(), 1, "{out:?}");
+        let EventData::NetListen(c) = &listens[0].data else {
+            panic!("kind");
+        };
+        assert_eq!(c.proto, "tcp");
+        assert_eq!(c.local, "0.0.0.0:4444");
+        assert_eq!(c.state, "listen");
+        assert_eq!(c.pid, Some(42));
+        assert_eq!(c.exe.as_deref(), Some("/usr/sbin/sshd"));
+        assert_eq!(listens[0].signals.len(), 1);
+        assert_eq!(listens[0].signals[0].rule, "net.listen");
+        assert_eq!(listens[0].signals[0].severity, Severity::Medium);
+        assert!(
+            out.iter().all(|e| e.kind() != "net.connect"),
+            "a listener is not a connection, including pool port 4444"
+        );
+        s.poll(40_000, &mut out);
+        assert_eq!(out.iter().filter(|e| e.kind() == "net.listen").count(), 1);
     }
 }

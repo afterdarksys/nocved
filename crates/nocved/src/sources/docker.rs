@@ -4,6 +4,8 @@
 //!
 //! Threats: the Docker socket is root-equivalent. This client can only send
 //! the allowlisted GETs; any other path is refused before connecting.
+//! `Privileged: true` and `NetworkMode` exactly `host` are signals on the
+//! inspect body this client already fetches. No other HostConfig field is read.
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -159,6 +161,20 @@ pub fn container_signals(ind: &Indicators, c: &ContainerInfo) -> Vec<Signal> {
             "docker.miner_image",
             Severity::Critical,
             format!("miner image {}", c.image),
+        ));
+    }
+    if c.privileged == Some(true) {
+        sig.push(Signal::new(
+            "docker.privileged",
+            Severity::High,
+            format!("container {} is privileged (image {})", c.name, c.image),
+        ));
+    }
+    if c.network_mode.as_deref() == Some("host") {
+        sig.push(Signal::new(
+            "docker.host_network",
+            Severity::High,
+            format!("container {} shares the host network namespace", c.name),
         ));
     }
     sig
@@ -437,7 +453,7 @@ pub mod fake {
         #[must_use]
         pub fn inspect_json(id: &str, name: &str, image: &str, restart: &str) -> String {
             format!(
-                r#"{{"Id":"{id}","Name":"/{name}","Created":"2026-09-28T23:43:00Z","Image":"sha256:e163ee86","Config":{{"Image":"{image}","Env":["SECRET=should-never-be-read"]}},"HostConfig":{{"RestartPolicy":{{"Name":"{restart}"}},"Privileged":false,"NetworkMode":"host"}}}}"#
+                r#"{{"Id":"{id}","Name":"/{name}","Created":"2026-09-28T23:43:00Z","Image":"sha256:e163ee86","Config":{{"Image":"{image}","Env":["SECRET=should-never-be-read"]}},"HostConfig":{{"RestartPolicy":{{"Name":"{restart}"}},"Privileged":false,"NetworkMode":"bridge"}}}}"#
             )
         }
 
@@ -521,6 +537,18 @@ mod tests {
         )
         .unwrap();
         assert!(container_signals(&ind, &ok).is_empty());
+        let host = parse_inspect(&serde_json::json!({
+            "Id": "d".repeat(64),
+            "Name": "/app",
+            "Config": {"Image": "app:1"},
+            "HostConfig": {"Privileged": true, "NetworkMode": "host"}
+        }))
+        .unwrap();
+        let host_rules: Vec<String> = container_signals(&ind, &host)
+            .into_iter()
+            .map(|s| s.rule)
+            .collect();
+        assert_eq!(host_rules, vec!["docker.privileged", "docker.host_network"]);
         assert!(
             !serde_json::to_string(&bad)
                 .unwrap()

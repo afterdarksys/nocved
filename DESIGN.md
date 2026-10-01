@@ -134,11 +134,11 @@ every parser is tested from fixtures on any OS.
 | Source | Interval | Reads | Emits |
 |---|---|---|---|
 | `process` | 2 s | `/proc/<pid>/{stat,status,cmdline,exe,cwd,cgroup}` | `process.start`, `process.exit`, `process.cpu` |
-| `net` | 5 s | `/proc/<pid>/net/{tcp,tcp6,udp,udp6}` per network namespace, `/proc/*/fd` inode map (only when a new public destination is unattributed) | `net.connect` (first time a process-exe talks to a public destination, TTL 1 h) |
+| `net` | 5 s | `/proc/<pid>/net/{tcp,tcp6,udp,udp6}` per network namespace, `/proc/*/fd` inode map (when a new public destination, or a TCP listener that appeared after the namespace baseline, is unattributed) | `net.connect` (first time a process-exe talks to a public destination, TTL 1 h); `net.listen` (TCP listener that appears after the first successful sample of that namespace; that first sample is recorded and emits nothing) |
 | `authlog` | 2 s | `/var/log/auth.log`, `/var/log/secure` | `ssh.auth`, `ssh.session`, `log.tamper` |
 | `docker` | 5 s | `/var/run/docker.sock`: `GET /events?since&until` (finite window), `/containers/json`, `/containers/{id}/json` | `container.seen`, `container.create`, `container.start` |
-| `packages` | 5 s | `/var/log/dpkg.log`, `/var/log/apt/history.log` | `package.change`, `package.transaction` |
-| `persistence` | 30 s | stat + SHA-256 of cron, systemd unit dirs, `ld.so.preload`, `authorized_keys`, sshd config, passwd/shadow/group/sudoers, PAM, profile.d, rc.local; lstat of shell history files | `persistence.baseline`, `persistence.change`, `history.devnull` |
+| `packages` | 5 s | `/var/log/dpkg.log`, `/var/log/apt/history.log` | `package.change`, `package.transaction`, `log.tamper` |
+| `persistence` | 30 s | stat + SHA-256 (never file bytes) of cron, anacrontab, at spools (`/var/spool/at`, `/var/spool/cron/atjobs`), systemd unit dirs including `/etc/systemd/user`, `/var/lib/systemd/linger`, and `{home}/.config/systemd/user`, `ld.so.preload` and `ld.so.conf.d`, `authorized_keys`, sshd, account files, sudoers, PAM, shell init (`profile`, `bash.bashrc`, zsh env/rc, `profile.d`), D-Bus system policy, polkit, udev rules, tmpfiles, modprobe; lstat of shell history. An entry cap, a nested-directory cap, or an unreadable directory is partial coverage. Vendor unit trees and `/run` stay with aftercve's one-shot snapshot. | `persistence.baseline`, `persistence.change`, `history.devnull` |
 
 Sensor meta events: `sensor.start` (version, boot id, coverage), and
 `sensor.events_dropped` (spool overflow count, section 8).
@@ -157,6 +157,7 @@ incident (the rule id is stable, versioned by name):
 | `session opened` for an sshd pid with no `Accepted` line | `authlog.orphan_session` | high |
 | auth.log truncated / replaced in place (`sed -i`) / silent while sshd sessions are live | `authlog.truncated`, `authlog.replaced`, `authlog.silent_with_sessions` | high |
 | `apt-get install unzip p7zip-full fd-find` | `pkg.secret_hunting_toolkit` (>= 2 tools in one transaction), `pkg.secret_hunting_tool` (one tool; high for trufflehog/gitleaks/masscan/proxychains-class) | high / medium |
+| dpkg.log or apt history truncated, replaced in place, deleted, or turned into a symlink | `pkglog.truncated`, `pkglog.replaced`, `pkglog.deleted`, `pkglog.symlink` | high |
 | `.bash_history -> /dev/null` | `history.devnull` | high |
 | exe under a hidden or temp dir (`/opt/.cache`, `/tmp`, `/dev/shm`, dot-dirs) not on the allowlist | `proc.exe_hidden_dir` | medium |
 | name looks like a kernel thread / system daemon but exe outside system dirs (`irqbalance-core`, `rcu-sched-worker`, `kcompactd0` in `/opt/.cache`) | `proc.masquerade` | high |
@@ -164,9 +165,11 @@ incident (the rule id is stable, versioned by name):
 | XMRig-style command line (`stratum+tcp://`, `--donate-level`, `-o pool:port`) | `proc.miner_cmdline` | critical |
 | sustained CPU > 80 % of a core for 60 s | `proc.high_cpu` | medium; high if the exe is hidden/masquerading |
 | connection to a configured mining-pool IP or port | `net.miner_pool_ip` / `net.miner_pool_port` | critical / high |
+| TCP listener that was not in the namespace's first sample (pool rules are not applied; UDP listeners are not events) | `net.listen` | medium |
 | container named like a system daemon (`dbus-daemon`, `systemd-networkd`, `kworker-events`) | `docker.masquerade_name` | high |
 | container image is proxyware/miner (`bitping/*`, `traffmonetizer/*`, `xmrig`) | `docker.proxyware_image` / `docker.miner_image` | critical |
-| new or changed persistence file | `persist.changed` | medium; high for `ld.so.preload`, `authorized_keys`, `sudoers`, `shadow`, sshd config |
+| container inspect says `Privileged` true, or `NetworkMode` is exactly `host` | `docker.privileged` / `docker.host_network` | high |
+| new or changed persistence file | `persist.changed` | medium; high for `ld.so.preload` and `ld.so.conf.d`, `authorized_keys`, sudoers, account files, sshd, PAM, D-Bus system policy, polkit, udev, modprobe |
 
 Negative requirements baked into tests: Playwright's Chromium under
 `/root/.cache/ms-playwright/` (allowlisted) does not get any miner/masquerade
@@ -321,10 +324,14 @@ Target < 1 % of one core and < 50 MB RSS on a host with ~500 processes and
 - process: one `stat` read per pid per 2 s; `cmdline/exe/cwd/status/cgroup`
   only for new pids. Tracking table capped at 65 536 pids.
 - net: one read of `net/tcp{,6}`/`udp{,6}` per network namespace per 5 s;
-  destination dedupe table capped at 16 384 entries with 1 h TTL; private,
-  loopback and link-local destinations ignored by default (the incident's
-  pool connection was to a public IP); the fd inode scan runs at most once per
-  10 s and only when a new public destination is unattributed.
+  destination dedupe table capped at 16 384 entries with 1 h TTL; TCP listen
+  keys (namespace, protocol, local address, port) capped at 16 384 with no
+  eviction — a full table is partial coverage and further listeners are not
+  emitted; the first successful sample records listeners and emits none;
+  private, loopback and link-local destinations ignored by default (the
+  incident's pool connection was to a public IP); the fd inode scan runs at
+  most once per 10 s and only when a new public destination, or a TCP listener
+  that appeared after the baseline, is unattributed.
 - logs: tail reads capped at 1 MiB per poll per file.
 - docker: finite `/events?since&until` window per poll, 2 s socket timeout,
   inspect at most 50 containers per poll.

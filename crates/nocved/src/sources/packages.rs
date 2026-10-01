@@ -1,13 +1,16 @@
 //! Package installs from /var/log/dpkg.log and /var/log/apt/history.log.
 //! Flags secret-hunting / recon tooling (the incident's `apt-get install -y
 //! unzip p7zip-full fd-find` on 7 hosts). Upgrades are never flagged.
+//! Truncation, in-place replacement, deletion, and a symlink in place of
+//! either log are `log.tamper` (`pkglog.*`, high). Those anomalies do not
+//! change source health, and a logrotate rename to a sibling is not one.
 
 use std::time::Duration;
 
 use nocve_proto::mask::mask_line;
 use nocve_proto::{Coverage, CoverageStatus, Event, EventData, Indicators, Severity, Signal};
 
-use super::tail::Tailer;
+use super::tail::{Anomaly, Tailer};
 use super::{Ctx, MAX_EVENTS_PER_POLL, Source, cap_events, coverage};
 use crate::config::SourceToggle;
 
@@ -214,7 +217,14 @@ impl Source for PackagesSource {
 
     fn poll(&mut self, now_ms: i64, out: &mut Vec<Event>) {
         let mut evs = Vec::new();
-        for line in self.dpkg.poll().lines {
+        let dpkg = self.dpkg.poll();
+        push_log_anomalies(
+            now_ms,
+            &shown_path(&self.ctx, self.dpkg.path()),
+            &dpkg.anomalies,
+            &mut evs,
+        );
+        for line in dpkg.lines {
             let Some(d) = parse_dpkg(&line) else { continue };
             let mut sig = Vec::new();
             if d.action == "install" {
@@ -248,7 +258,14 @@ impl Source for PackagesSource {
                 .with_signals(sig),
             );
         }
-        for line in self.apt.poll().lines {
+        let apt = self.apt.poll();
+        push_log_anomalies(
+            now_ms,
+            &shown_path(&self.ctx, self.apt.path()),
+            &apt.anomalies,
+            &mut evs,
+        );
+        for line in apt.lines {
             if let Some(t) = self.parser.feed(&line) {
                 let sig = txn_signals(&self.ctx.ind, &t);
                 evs.push(
@@ -293,9 +310,58 @@ impl Source for PackagesSource {
     }
 }
 
+fn shown_path(ctx: &Ctx, path: &std::path::Path) -> String {
+    path.strip_prefix(&ctx.root).map_or_else(
+        |_| path.display().to_string(),
+        |p| format!("/{}", p.display()),
+    )
+}
+
+fn push_log_anomalies(now_ms: i64, path: &str, anomalies: &[Anomaly], evs: &mut Vec<Event>) {
+    for anomaly in anomalies {
+        let (rule, reason, detail) = match anomaly {
+            Anomaly::Truncated { from, to } => (
+                "pkglog.truncated",
+                "truncated",
+                format!("{path} shrank from {from} to {to} bytes"),
+            ),
+            Anomaly::Replaced {
+                old_inode,
+                new_inode,
+                old_unlinked,
+            } => (
+                "pkglog.replaced",
+                "replaced",
+                format!(
+                    "{path} replaced in place (inode {old_inode} -> {new_inode}, old unlinked: {old_unlinked}); typical of sed -i"
+                ),
+            ),
+            Anomaly::Deleted => ("pkglog.deleted", "deleted", format!("{path} was deleted")),
+            Anomaly::Symlink => (
+                "pkglog.symlink",
+                "symlink",
+                format!("{path} is now a symlink (not followed)"),
+            ),
+        };
+        evs.push(
+            Event::new(
+                now_ms,
+                "packages",
+                EventData::LogTamper {
+                    path: path.to_owned(),
+                    reason: reason.to_owned(),
+                    detail: detail.clone(),
+                },
+            )
+            .with_signals(vec![Signal::new(rule, Severity::High, detail)]),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn ind() -> Indicators {
         Indicators::builtin().unwrap()
@@ -357,6 +423,33 @@ mod tests {
         let t = done.unwrap();
         assert_eq!(t.upgrade.len(), 3);
         assert!(txn_signals(&ind(), &t).is_empty());
+    }
+
+    #[test]
+    fn replaced_dpkg_log_is_tamper() {
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("var/log/dpkg.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "2026-09-20 19:18:52 install unzip:amd64 <none> 1\n").unwrap();
+        let mut s = PackagesSource::new(
+            Ctx {
+                root: d.path().to_path_buf(),
+                ind: Arc::new(ind()),
+            },
+            SourceToggle::default(),
+        );
+        let mut out = Vec::new();
+        s.poll(0, &mut out);
+        assert!(out.iter().all(|e| e.kind() != "log.tamper"));
+        std::fs::remove_file(&log).unwrap();
+        std::fs::write(&log, "2026-09-20 19:18:52 install masscan:amd64 <none> 1\n").unwrap();
+        s.poll(5_000, &mut out);
+        let tamper: Vec<&Event> = out.iter().filter(|e| e.kind() == "log.tamper").collect();
+        assert_eq!(tamper.len(), 1);
+        assert_eq!(tamper[0].signals[0].rule, "pkglog.replaced");
+        assert_eq!(tamper[0].max_severity(), Some(Severity::High));
+        let body = serde_json::to_string(&tamper[0]).unwrap();
+        assert!(!body.contains("masscan"));
         assert!(
             parse_dpkg("2026-09-15 06:25:10 upgrade unzip:amd64 6.0-23 6.0-23+deb10u3").is_some()
         );

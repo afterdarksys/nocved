@@ -1,6 +1,16 @@
 //! Persistence-location watch: stat + SHA-256 (never content) of cron,
-//! systemd units, ld.so.preload, authorized_keys, sshd config, account files,
-//! sudoers, PAM and shell init; lstat of shell history files for `-> /dev/null`.
+//! anacron, at spools, systemd unit dirs (including per-user units and
+//! linger), ld.so.preload and ld.so.conf.d, authorized_keys, sshd config,
+//! account files, sudoers, PAM, shell init, D-Bus system policy, polkit,
+//! udev, tmpfiles and modprobe; lstat of shell history files for `-> /dev/null`.
+//!
+//! Threats: a rooted host can hide paths from this walk or forge inode
+//! timestamps. The walk reports partial coverage when an entry cap, a nested
+//! directory cap, or an unreadable directory drops paths. Content is hashed
+//! with `O_NOFOLLOW`, so a symlink is recorded as a link and not followed.
+//! File bytes are never emitted. Vendor unit trees, `/run`, and cgroupfs are
+//! outside this source: aftercve snapshots service units, and a live cgroup
+//! tree is not a 30-second hash set.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
@@ -24,6 +34,7 @@ const MAX_HOMES: usize = 200;
 
 const FILES: &[(&str, &str)] = &[
     ("/etc/crontab", "cron"),
+    ("/etc/anacrontab", "cron"),
     ("/etc/ld.so.preload", "ld_preload"),
     ("/etc/ld.so.conf", "ld_preload"),
     ("/etc/passwd", "accounts"),
@@ -33,6 +44,10 @@ const FILES: &[(&str, &str)] = &[
     ("/etc/sudoers", "sudo"),
     ("/etc/rc.local", "shell_init"),
     ("/etc/environment", "shell_init"),
+    ("/etc/profile", "shell_init"),
+    ("/etc/bash.bashrc", "shell_init"),
+    ("/etc/zsh/zshenv", "shell_init"),
+    ("/etc/zsh/zshrc", "shell_init"),
     ("/etc/ssh/sshd_config", "sshd"),
     ("/root/.ssh/authorized_keys", "ssh_keys"),
     ("/root/.ssh/authorized_keys2", "ssh_keys"),
@@ -49,14 +64,27 @@ const DIRS: &[(&str, &str)] = &[
     ("/etc/cron.monthly", "cron"),
     ("/var/spool/cron/crontabs", "cron"),
     ("/var/spool/cron", "cron"),
+    ("/var/spool/at", "at"),
+    ("/var/spool/cron/atjobs", "at"),
     ("/etc/systemd/system", "systemd"),
     ("/usr/local/lib/systemd/system", "systemd"),
+    ("/etc/systemd/user", "systemd"),
     ("/root/.config/systemd/user", "systemd"),
+    ("/var/lib/systemd/linger", "systemd"),
     ("/etc/ssh/sshd_config.d", "sshd"),
     ("/etc/sudoers.d", "sudo"),
     ("/etc/profile.d", "shell_init"),
     ("/etc/pam.d", "pam"),
     ("/etc/update-motd.d", "shell_init"),
+    ("/etc/ld.so.conf.d", "ld_preload"),
+    ("/etc/dbus-1/system.d", "dbus"),
+    ("/etc/dbus-1/system-services", "dbus"),
+    ("/etc/polkit-1/rules.d", "polkit"),
+    ("/etc/polkit-1/localauthority", "polkit"),
+    ("/etc/udev/rules.d", "udev"),
+    ("/etc/tmpfiles.d", "tmpfiles"),
+    ("/etc/modprobe.d", "modprobe"),
+    ("/etc/modules-load.d", "modprobe"),
 ];
 
 const HISTORY_FILES: &[&str] = &[
@@ -72,8 +100,32 @@ const HISTORY_FILES: &[&str] = &[
 
 fn severity_for(category: &str) -> Severity {
     match category {
-        "ld_preload" | "ssh_keys" | "sudo" | "accounts" | "sshd" | "pam" => Severity::High,
+        "ld_preload" | "ssh_keys" | "sudo" | "accounts" | "sshd" | "pam" | "dbus" | "polkit"
+        | "udev" | "modprobe" => Severity::High,
         _ => Severity::Medium,
+    }
+}
+
+struct TargetWalk {
+    items: Vec<(String, String)>,
+    hit_entry_cap: bool,
+    hit_child_cap: bool,
+    unreadable: bool,
+}
+
+impl TargetWalk {
+    fn push(&mut self, path: String, cat: &str) -> bool {
+        if self.items.len() >= MAX_ENTRIES {
+            self.hit_entry_cap = true;
+            false
+        } else {
+            self.items.push((path, cat.to_owned()));
+            true
+        }
+    }
+
+    fn capped(&self) -> bool {
+        self.hit_entry_cap || self.hit_child_cap || self.unreadable
     }
 }
 
@@ -108,45 +160,89 @@ impl PersistenceSource {
         v
     }
 
-    fn targets(&self) -> Vec<(String, String)> {
-        let mut t: Vec<(String, String)> = FILES
-            .iter()
-            .map(|(p, c)| ((*p).to_owned(), (*c).to_owned()))
-            .collect();
+    fn targets(&self) -> TargetWalk {
+        let mut walk = TargetWalk {
+            items: FILES
+                .iter()
+                .map(|(p, c)| ((*p).to_owned(), (*c).to_owned()))
+                .collect(),
+            hit_entry_cap: false,
+            hit_child_cap: false,
+            unreadable: false,
+        };
         for (shown, _) in self.homes().into_iter().skip(1) {
-            t.push((format!("{shown}/.ssh/authorized_keys"), "ssh_keys".into()));
-            t.push((format!("{shown}/.ssh/authorized_keys2"), "ssh_keys".into()));
+            if !walk.push(format!("{shown}/.ssh/authorized_keys"), "ssh_keys") {
+                break;
+            }
+            if !walk.push(format!("{shown}/.ssh/authorized_keys2"), "ssh_keys") {
+                break;
+            }
+            self.add_dir(
+                &mut walk,
+                &format!("{shown}/.config/systemd/user"),
+                "systemd",
+            );
         }
         for (dir, cat) in DIRS {
-            let Ok(rd) = std::fs::read_dir(self.ctx.path(dir)) else {
-                continue;
-            };
-            let mut names: Vec<String> = rd
-                .filter_map(Result::ok)
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            for n in names {
-                let p = format!("{dir}/{n}");
-                // One nested level for systemd *.wants / *.d and cron spool dirs.
-                if let Ok(m) = std::fs::symlink_metadata(self.ctx.path(&p))
-                    && m.is_dir()
-                    && let Ok(sub) = std::fs::read_dir(self.ctx.path(&p))
-                {
-                    for e in sub.filter_map(Result::ok).take(1024) {
-                        t.push((
-                            format!("{p}/{}", e.file_name().to_string_lossy()),
-                            (*cat).to_owned(),
-                        ));
+            self.add_dir(&mut walk, dir, cat);
+        }
+        walk
+    }
+
+    /// One directory level, plus one nested level for systemd drop-ins and
+    /// spool directories. Missing directories are normal; any other read
+    /// error is a coverage gap.
+    fn add_dir(&self, walk: &mut TargetWalk, dir: &str, cat: &str) {
+        if walk.hit_entry_cap {
+            return;
+        }
+        let rd = match std::fs::read_dir(self.ctx.path(dir)) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => {
+                walk.unreadable = true;
+                return;
+            }
+        };
+        let mut names: Vec<String> = rd
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for n in names {
+            if walk.hit_entry_cap {
+                return;
+            }
+            let p = format!("{dir}/{n}");
+            if let Ok(m) = std::fs::symlink_metadata(self.ctx.path(&p))
+                && m.is_dir()
+            {
+                match std::fs::read_dir(self.ctx.path(&p)) {
+                    Ok(sub) => {
+                        let mut children = Vec::new();
+                        for e in sub.filter_map(Result::ok) {
+                            children.push(e.file_name().to_string_lossy().into_owned());
+                            if children.len() > 1024 {
+                                walk.hit_child_cap = true;
+                                break;
+                            }
+                        }
+                        children.truncate(1024);
+                        children.sort();
+                        for c in children {
+                            if !walk.push(format!("{p}/{c}"), cat) {
+                                return;
+                            }
+                        }
                     }
-                }
-                t.push((p, (*cat).to_owned()));
-                if t.len() >= MAX_ENTRIES {
-                    return t;
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => walk.unreadable = true,
                 }
             }
+            if !walk.push(p, cat) {
+                return;
+            }
         }
-        t
     }
 
     fn digest(&self, shown: &str, prev: Option<&FileDigest>) -> Option<FileDigest> {
@@ -271,7 +367,9 @@ impl Source for PersistenceSource {
         self.history_devnull(now_ms, &mut evs);
         let mut now_map = BTreeMap::new();
         let prev_map = self.known.take();
-        for (shown, cat) in self.targets() {
+        let walk = self.targets();
+        let capped = walk.capped();
+        for (shown, cat) in walk.items {
             let prev = prev_map
                 .as_ref()
                 .and_then(|m| m.get(&shown))
@@ -365,7 +463,7 @@ impl Source for PersistenceSource {
                             )
                             .with_signals(vec![Signal::new(
                                 "persist.changed",
-                                Severity::Medium,
+                                severity_for(cat),
                                 format!("{cat} location removed: {p}"),
                             )]),
                         );
@@ -381,6 +479,12 @@ impl Source for PersistenceSource {
                 "persistence",
                 CoverageStatus::Failed,
                 "no persistence locations readable",
+            )
+        } else if capped {
+            coverage(
+                "persistence",
+                CoverageStatus::Partial,
+                format!("{n} locations watched; directory walk hit a cap or unreadable directory"),
             )
         } else {
             coverage(
@@ -509,5 +613,94 @@ mod tests {
         let mut out = Vec::new();
         s.poll(0, &mut out);
         assert_eq!(out[0].signals[0].rule, "persist.ld_preload_present");
+    }
+
+    #[test]
+    fn added_policy_paths_are_hashed_and_removal_keeps_category_severity() {
+        let d = tempfile::tempdir().unwrap();
+        w(d.path(), "/etc/ld.so.preload", "/usr/lib/libhide.so\n");
+        w(d.path(), "/etc/ld.so.conf.d/libc.conf", "libc6\n");
+        w(
+            d.path(),
+            "/etc/polkit-1/rules.d/49-evil.rules",
+            "polkit.addRule(function(){return polkit.Result.YES;});\n",
+        );
+        w(d.path(), "/var/spool/at/a0000100", "echo staged\n");
+        w(
+            d.path(),
+            "/etc/dbus-1/system.d/evil.conf",
+            "<busconfig></busconfig>\n",
+        );
+        w(
+            d.path(),
+            "/home/ryan/.config/systemd/user/stay.service",
+            "[Service]\n",
+        );
+        let mut s = src(d.path());
+        let mut out = Vec::new();
+        s.poll(0, &mut out);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains("polkit.addRule") && !json.contains("echo staged"));
+        assert!(json.contains("/etc/ld.so.conf.d/libc.conf"));
+        assert!(json.contains("/var/spool/at/a0000100"));
+        assert!(json.contains("/home/ryan/.config/systemd/user/stay.service"));
+        std::fs::remove_file(d.path().join("etc/ld.so.preload")).unwrap();
+        w(
+            d.path(),
+            "/etc/udev/rules.d/99-evil.rules",
+            "ACTION==\"add\", RUN+=\"/tmp/x\"\n",
+        );
+        s.poll(30_000, &mut out);
+        let changes: Vec<(String, String, Severity)> = out
+            .iter()
+            .filter_map(|e| match &e.data {
+                EventData::PersistenceChange { path, change, .. } => {
+                    Some((path.clone(), change.clone(), e.max_severity().unwrap()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(changes.contains(&(
+            "/etc/ld.so.preload".into(),
+            "removed".into(),
+            Severity::High
+        )));
+        assert!(changes.contains(&(
+            "/etc/udev/rules.d/99-evil.rules".into(),
+            "added".into(),
+            Severity::High
+        )));
+        assert_eq!(s.health().status, CoverageStatus::Completed);
+    }
+
+    #[test]
+    fn nested_directory_over_1024_is_partial() {
+        let d = tempfile::tempdir().unwrap();
+        let nested = d.path().join("etc/systemd/system/foo.service.d");
+        std::fs::create_dir_all(&nested).unwrap();
+        for i in 0..1025 {
+            std::fs::write(nested.join(format!("drop-{i:04}.conf")), "x\n").unwrap();
+        }
+        let mut s = src(d.path());
+        let mut out = Vec::new();
+        s.poll(0, &mut out);
+        assert_eq!(s.health().status, CoverageStatus::Partial);
+        let EventData::PersistenceBaseline { entries, .. } = &out[0].data else {
+            panic!("baseline");
+        };
+        let watched = s.known.as_ref().unwrap().len();
+        let nested_files = s
+            .known
+            .as_ref()
+            .unwrap()
+            .keys()
+            .filter(|p| p.contains("foo.service.d/drop-"))
+            .count();
+        assert_eq!(
+            nested_files,
+            1024,
+            "watched {watched}, baseline {}",
+            entries.len()
+        );
     }
 }
