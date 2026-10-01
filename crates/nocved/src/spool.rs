@@ -517,6 +517,44 @@ mod tests {
         );
     }
 
+    /// A `persistence.baseline` too big for the feed: the spool keeps the
+    /// real envelope, the feed gets its compact stand-in under the same seq,
+    /// so a start produces no skipped line and no seq gap for the reader.
+    #[test]
+    fn oversized_baseline_is_compacted_in_feed_only() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Spool::open(&d.path().join("state"), "h", key(), 1 << 20).unwrap();
+        let cfg = crate::feed::FeedConfig {
+            enabled: true,
+            dir: d.path().join("feed"),
+            group: None,
+            max_bytes: 1 << 20,
+        };
+        s.set_feed(crate::feed::Feed::open(&cfg, None).unwrap());
+        assert!(s.push(&ev(0, None)));
+        assert!(s.push(&crate::feed::baseline_event(60, 0)));
+        assert!(s.push(&ev(2, None)));
+        let spooled: Vec<String> = s.peek(10, usize::MAX).into_iter().map(|x| x.1).collect();
+        assert!(
+            spooled[1].len() > 12 * 1024,
+            "the spool keeps the full line"
+        );
+        assert_eq!(s.feed_skipped(), Some((0, 0)));
+        let fed = std::fs::read_to_string(cfg.dir.join(crate::feed::FEED_FILE)).unwrap();
+        let fed: Vec<&str> = fed.lines().collect();
+        assert_eq!(fed.len(), 3, "one feed line per seq");
+        assert_eq!((fed[0], fed[2]), (spooled[0].as_str(), spooled[2].as_str()));
+        assert!(fed[1].len() < crate::feed::MAX_FEED_LINE);
+        let full: Envelope = serde_json::from_str(&spooled[1]).unwrap();
+        let compact: Envelope = serde_json::from_str(fed[1]).unwrap();
+        assert_eq!(
+            (compact.seq, &compact.epoch, &compact.prev, &compact.mac),
+            (full.seq, &full.epoch, &full.prev, &full.mac)
+        );
+        assert!(compact.payload.contains("\"feed_compact\":true"));
+        full.verify(&key()).unwrap();
+    }
+
     #[test]
     fn state_for_other_host_starts_new_epoch() {
         let d = tempfile::tempdir().unwrap();

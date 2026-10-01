@@ -600,6 +600,22 @@ Ansible playbook, key minted on the controller and written with `no_log`.
   alerts and gaps kept for `alert_retention_days` (default 400).
 - `GET /v1/hosts` also reports `feed: {skipped_long, skipped_burst}` from the
   sensor heartbeat (null when the host runs no cveguard feed, section 21).
+- Values darksignal would refuse are fixed at ingest, not at the forwarder
+  (a darksignal `0x00` is final, so the alert would be lost):
+  - an event `observed_at_ms` outside darksignal's time range
+    (`0..=4102444800000`, `nocve_store::valid_time`) is replaced by the
+    store clock for the stored event, its alert and the sweep correlation,
+    and raises `sensor.clock_skew` (high) with `{seq, raw_observed_at_ms,
+    replaced_with}` in `detail`. The MACed payload keeps the raw value.
+  - a relayed signal rule that is not 1-128 bytes of `[A-Za-z0-9._-]`
+    (`nocve_store::valid_rule`) raises `sensor.bad_rule` instead, with
+    `{seq, raw_rule, raw_rule_bytes}` in `detail` (`raw_rule` is the rule
+    `escape_default`-escaped, so ASCII only, cut at 256 bytes).
+  - `tests/darksignal_contract.rs` holds golden copies of darksignal's
+    `valid_host`, `valid_rule` and `valid_time` and checks every rule the
+    store or nocved can emit, the store's host rule, and the replacement
+    times against them. darksignal has no class for `sensor.bad_rule` yet:
+    it answers `0x01` and drops it until its table names it.
 
 ### Alert forwarder to darksignal (P5)
 
@@ -625,11 +641,19 @@ It opens the database `query_only` and reads alerts with the same query as
   no alert the store raises names a host darksignal would refuse (a refusal
   advances the cursor, so it would be lost). A key minted under the older
   looser rule is refused at ingest (403 `bad_host`); re-mint it.
-- Ack: `0x01` advances the cursor. `0x00` (refused) advances it and counts a
-  refusal (logged at 1, 2, 4, 8, ... refusals): a refusal is darksignal's
-  final answer. Anything else (connect error, no byte, a short read, another
-  byte) leaves the cursor and backs off 1 s, doubling, capped at 5 min;
-  a delivered or idle pass resets it. Idle polling is every 2 s.
+- Ack (one byte per frame, the shared darksignal IPC table):
+
+  | byte | name | darksignal meaning | forwarder action |
+  |------|------|--------------------|------------------|
+  | `0x01` | ACCEPTED | stored, duplicate, evicted-older, or dropped by its classifier | advance the cursor |
+  | `0x00` | REFUSED | permanent, the producer's fault: malformed frame, a field that fails validation, wrong tool for the peer | advance, count (`refused`) and log every one by id and rule; the row is lost by design |
+  | `0x02` | RETRY | transient: peer identity unreadable, queue full, store error | do NOT advance; count (`retried`), stop the pass, resend the same row after the backoff |
+  | other / none | - | connect error, no byte, short read, timeout, unknown byte | same as `0x02` |
+
+  Backoff is 1 s, doubling, capped at 5 min; a delivered or idle pass resets
+  it. Idle polling is every 2 s. Ingest validation (section 15, "Values
+  darksignal would refuse") keeps the store from raising rows darksignal
+  answers `0x00`.
 - Cursor: the last answered alert id as decimal text, in a 0600 file written
   by temp file + fsync + rename + directory fsync. Missing = start at 0 (all
   retained alerts). A corrupt or symlinked cursor stops the forwarder.
@@ -766,7 +790,35 @@ unchanged, to `/var/lib/nocved/cveguard-feed/events.jsonl` (configurable
      line, and any loss nocved causes is counted, not silent.
   5. A reader slower than that can still lose a generation. Envelopes carry
      a contiguous `(epoch, seq)`, so the reader detects the gap.
-- Lines over 8192 bytes are skipped (afterguard rejects them) and counted.
+- Compact stand-ins: afterguard rejects lines over 8192 bytes, and a
+  `persistence.baseline` envelope is 12-24 KB on a real host, so every start
+  used to cost a skipped line and a cveguard `feed_gap`. An envelope line
+  that does not fit (line plus newline over 8192 bytes) is written to the
+  FEED ONLY as a stand-in (`nocved::feed::compact_line`); the spool, the
+  chain and the MAC are untouched, and there is still exactly one feed line
+  per seq, so the reader sees no gap. The stand-in keeps `v`, `host`,
+  `epoch`, `seq`, `prev` and the ORIGINAL `mac` (which does not verify over
+  the stand-in payload); `payload` becomes a JSON object with:
+  - always: `feed_compact: true`, `observed_at_ms`, `source`,
+    `orig_bytes` and `orig_sha256` (length and SHA-256 of the original
+    payload text), `signals_count`, and `signals` as `[{rule, severity}]`
+    (summaries dropped; the list itself is dropped last if nothing else
+    fits);
+  - `persistence.baseline`: the same `kind`, `truncated`, `count` (all
+    entries), and `locations`: one `{path, category, count, sha256}` per
+    (parent directory, category), sorted, where `sha256` is over the JSON
+    array of that location's entries exactly as the original payload
+    encodes them. If the list does not fit, the most locations that fit are
+    kept and the tail is folded into `rest: {locations, count, sha256}`
+    (`sha256` over the JSON array of all folded entries, in order);
+  - any other kind: `kind: "feed.compact"` and `orig_kind`, so a reader that
+    parses the original kind (exec, net, package) never mistakes a summary
+    for the event.
+  The stand-in always fits (its fixed part is under 1 KB); only a line that
+  is not an envelope at all is skipped and counted (`skipped_long`).
+  Stand-ins are counted (`compacted`). Feed lines, compact or not, are
+  unauthenticated to the reader: cveguard must not treat a feed line, and
+  above all a stand-in, as verified.
 - Skipped lines are reported: the heartbeat carries `feed_skipped_long` and
   `feed_skipped_burst` (absent without a feed), the store shows them in
   `GET /v1/hosts` (`feed`), and coverage says `feed: completed`, or
