@@ -29,6 +29,9 @@ and the darksignal alert forwarder (`nocve-store forward`).
 | `crates/nocve-store/src/forward.rs` | `nocve-store forward`: alerts to the local darksignal socket (DESIGN.md section 15) |
 | `crates/nocved/src/feed.rs` | optional read-only envelope feed for cveguard (off by default, DESIGN.md section 21) |
 | `deploy/` | `nocved.service`, `nocve-store.service`, `nocve-store-forward.service`, `install.sh`, `config.example.json`, `audit/nocved.rules`, Ansible skeleton |
+| `crates/nocve-proto/src/cli.rs` | CLI output contract: JSON envelope, error line, status files |
+| `crates/nocved/tests/cli.rs`, `crates/nocve-store/tests/cli.rs` | `--json`, error, help and status tests for both binaries |
+| `docs/output-contract.md` | After Dark CLI output contract (v1) |
 | `scripts/measure.sh` | CPU/RSS sampling on a test host |
 
 ## Commands
@@ -70,7 +73,8 @@ curl https://nocve.afterdarksys.com/healthz           # unauthenticated liveness
 useradd --system --no-create-home --shell /usr/sbin/nologin nocve-store   # fixed uid for darksignal
 nocve-store forward --db /var/lib/nocve-store/nocve.db \
   --darksignal-socket /run/darksignal-store/darksignal.sock \
-  --cursor /var/lib/nocve-store/forward.cursor [--host NAME]
+  --cursor /var/lib/nocve-store/forward.cursor [--host NAME] [--status PATH]
+nocve-store status            # reads /var/lib/nocve-store/forward.status.json
 ```
 
 Run it as `deploy/nocve-store-forward.service` (`User=nocve-store`,
@@ -95,6 +99,7 @@ alerts plus fleet-wide ones (`host: null`, e.g. `fleet.password_sweep`).
 ./install.sh --binary ./nocved-linux-amd64 --sha256 <hex> \
   --url https://nocve.afterdarksys.com --key-stdin < /dev/tty
 nocved check --config /etc/nocved/config.json   # polls every source once, sends nothing
+nocved status --config /etc/nocved/config.json  # local status file, `stale` if the sensor stopped writing
 ```
 
 `install.sh` also installs `deploy/audit/nocved.rules` (an `execve` audit
@@ -102,3 +107,71 @@ rule) into `/etc/audit/rules.d/` when auditd is present and loads it with
 `augenrules --load`; `--no-audit-rules` skips it. Without that rule the
 auditd source reports coverage `partial`. The unit is `Type=notify` with
 `WatchdogSec=60`: a poll loop that stops ticking is restarted by systemd.
+
+## CLI output and exit codes
+
+Both binaries follow the After Dark CLI output contract
+(`docs/output-contract.md`). Every command takes `--json` (or
+`--format json`; `--format text` is the default): stdout then carries
+exactly one compact JSON object, newline-terminated, that starts with
+`{"schema_version":1,"kind":"<tool>.<command>","tool":"<tool>","tool_version":"<semver>", ...}`.
+Logs, progress and warnings go to stderr. No command is machine-primary:
+all default to human text. `-h`/`--help` on any command (and `<tool> help
+[command]`) prints usage, flags and exit codes and exits 0; `--version` and
+`version` print the version.
+
+| Command | Default | `kind` (`--json`) | Exit codes |
+|---|---|---|---|
+| `nocved run` | daemon (stdout empty) | none; status file below | 1 runtime/config, 2 usage |
+| `nocved check` | human | `nocved.check` | 0, 1, 2 |
+| `nocved status` | human | `nocved.status` | 0 (also when stale), 1, 2 |
+| `nocved version` | human | `nocved.version` | 0, 2 |
+| `nocve-store serve` | daemon (stdout empty) | none; status is `GET /healthz` | 1 runtime, 2 usage |
+| `nocve-store forward` | daemon (stdout empty) | none; status file below | 1 runtime/config, 2 usage |
+| `nocve-store keys mint` | raw token, one line | `nocve-store.keys.mint` (`secret`, `key_id`, `host`, `active_keys`, `warning`) | 0, 1, 2 |
+| `nocve-store keys revoke` | human | `nocve-store.keys.revoke` (`revoked`) | 0, 1 (incl. refused), 2 |
+| `nocve-store keys list` | human | `nocve-store.keys.list` (`keys`) | 0, 1, 2 |
+| `nocve-store admin mint` | raw token, one line | `nocve-store.admin.mint` (`secret`, `token_id`, `label`) | 0, 1, 2 |
+| `nocve-store admin revoke` | human | `nocve-store.admin.revoke` (`revoked`) | 0, 1, 2 |
+| `nocve-store status` | human | `nocve-store.status` | 0 (also when stale), 1, 2 |
+| `nocve-store version` | human | `nocve-store.version` | 0, 2 |
+| `help`, `--help` (both) | human | `<tool>.help` (`usage`) | 0 |
+
+Exit codes: 0 success; 1 runtime failure (I/O, database, socket, refused
+revoke) and also configuration errors (bad or unreadable config or key);
+2 usage error (unknown command or option, missing or invalid value). Before
+the contract every failure exited 1; usage errors now exit 2, nothing else
+moved. Configuration errors keep 1, not the contract's default 2.
+
+Minted credentials: text mode is unchanged (the raw token alone on stdout,
+the key id and rotation warning on stderr), so `deploy/ansible/nocved.yml`
+(`nv_minted.stdout | trim`) keeps working. With `--json` the token is only in
+the `secret` field and nothing is written to stderr. No secret is ever
+written to stderr, to a status file or into an error message.
+
+Errors: in `--json` mode every failure, usage errors included, is one line
+on stderr and stdout stays empty:
+
+```json
+{"schema_version":1,"kind":"error","tool":"nocve-store","command":"keys.mint","category":"usage","message":"keys mint needs --host","exit_code":2}
+```
+
+`command` is the dotted command (`check`, `keys.mint`, ...) or `null` for an
+unknown one; `category` is `usage`, `config`, `io`, `refused` or `integrity`
+here. In text mode the error is one line, `<tool>: <message>`. Control and
+bidi characters in messages are escaped (`\u{1b}`).
+
+Status files (rewritten atomically, 0600, at least every 30 s and on a clean
+stop; `kind`, `updated_at_ms`, `interval_ms` plus the daemon's counters):
+
+| Daemon | File | Reader |
+|---|---|---|
+| `nocved run` | `<state_dir>/status.json` (`/var/lib/nocved/status.json`): state, pid, host, `last_tick_ms`, `last_heartbeat_ok_ms`, `last_ship_ok_ms`, `spool_events`, `spool_bytes`, `dropped_total`, `coverage` | `nocved status [--config PATH]` |
+| `nocve-store forward` | `--status PATH`, default `forward.status.json` next to `--cursor` (`/var/lib/nocve-store/forward.status.json`): state, cursor, `accepted`, `refused`, `retried`, `truncated`, `oversized`, `backoff_ms`, `last_progress_ms`, `last_error` | `nocve-store status [--forward-status PATH]` |
+| `nocve-store serve` | none | `curl http://127.0.0.1:8750/healthz` |
+
+The readers take no lock and change nothing. They add `stale` (true when
+`updated_at_ms` is more than 3 x `interval_ms`, 90 s, old) and `age_ms`. A
+SIGTERM from systemd ends `nocved run` without the final `stopped` write
+(there is no signal handler), so a stopped sensor shows up as stale
+`running`.

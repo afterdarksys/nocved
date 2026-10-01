@@ -1,9 +1,12 @@
 //! Main loop: poll due sources, spool chained events; a shipper thread pushes
 //! batches and heartbeats so a slow store never blocks polling.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use nocve_proto::cli::{self, STATUS_INTERVAL_MS};
 
 use nocve_proto::{Coverage, CoverageStatus, Event, EventData, Token};
 
@@ -235,7 +238,69 @@ fn jitter_ms(max: u64) -> u64 {
     u64::from_le_bytes(b) % max
 }
 
-/// Runs until `stop` is set.
+/// Kind of the status document `run` keeps in `state_dir`.
+pub const STATUS_KIND: &str = "nocved.status";
+
+/// `<state_dir>/status.json`: written by `run`, read by `nocved status`.
+#[must_use]
+pub fn status_path(cfg: &Config) -> PathBuf {
+    cfg.state_dir.join("status.json")
+}
+
+/// Local liveness and the counters the sensor already keeps.
+struct StatusInfo<'a> {
+    state: &'a str,
+    started_at_ms: i64,
+    last_tick_ms: i64,
+    last_heartbeat_ok_ms: i64,
+    last_ship_ok_ms: i64,
+    coverage: Vec<Coverage>,
+}
+
+fn opt_ms(v: i64) -> serde_json::Value {
+    if v > 0 {
+        v.into()
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+/// Writes `status.json` atomically (0600). A failure is logged, never fatal:
+/// local status must not stop the sensor.
+fn write_status(cfg: &Config, sensor: &Sensor, info: StatusInfo<'_>, now: i64) {
+    let (events, bytes, dropped) = match sensor.spool.lock() {
+        Ok(sp) => (sp.len(), sp.bytes(), sp.dropped_total),
+        Err(_) => (0, 0, 0),
+    };
+    let fields = serde_json::json!({
+        "state": info.state,
+        "pid": std::process::id(),
+        "host": sensor.host,
+        "store_url": cfg.store_url,
+        "started_at_ms": info.started_at_ms,
+        "last_tick_ms": opt_ms(info.last_tick_ms),
+        "last_heartbeat_ok_ms": opt_ms(info.last_heartbeat_ok_ms),
+        "last_ship_ok_ms": opt_ms(info.last_ship_ok_ms),
+        "spool_events": events,
+        "spool_bytes": bytes,
+        "dropped_total": dropped,
+        "coverage": info.coverage,
+    });
+    let doc = cli::status_doc(
+        "nocved",
+        env!("CARGO_PKG_VERSION"),
+        STATUS_KIND,
+        now,
+        fields,
+    );
+    let path = status_path(cfg);
+    if let Err(e) = crate::fsutil::write_atomic_0600(&path, format!("{doc}\n").as_bytes()) {
+        eprintln!("nocved: status {}: {e}", path.display());
+    }
+}
+
+/// Runs until `stop` is set. Rewrites `status.json` every
+/// `STATUS_INTERVAL_MS` and once more when it stops.
 pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
     let mut sensor = Sensor::new(cfg, key)?;
     let shipper = Shipper::new(&cfg.store_url, key, &sensor.host);
@@ -251,7 +316,8 @@ pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(",")
     );
-    sensor.start(now_ms())?;
+    let started_at_ms = now_ms();
+    sensor.start(started_at_ms)?;
     let cov = Arc::new(Mutex::new(sensor.coverage()));
     let spool = Arc::clone(&sensor.spool);
     let hb_ms = i64::try_from(cfg.heartbeat_secs).unwrap_or(30) * 1000;
@@ -261,6 +327,10 @@ pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
     // sent by the shipper thread, so without this a frozen poll loop would look
     // healthy at the store.
     let last_tick = AtomicI64::new(0);
+    // Shipper-thread results for the local status file (0 = never).
+    let last_hb_ok = AtomicI64::new(0);
+    let last_ship_ok = AtomicI64::new(0);
+    let mut last_status = i64::MIN;
     let notifier = Notifier::from_env();
     if let Some(n) = &notifier
         && let Err(e) = n.notify("READY=1")
@@ -278,7 +348,7 @@ pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
                     let c = cov2.lock().map(|c| c.clone()).unwrap_or_default();
                     let tick = Some(last_tick.load(Ordering::Relaxed)).filter(|t| *t > 0);
                     match shipper.heartbeat(&spool, c, now, boot_id.clone(), tick) {
-                        Ok(200) => {}
+                        Ok(200) => last_hb_ok.store(now, Ordering::Relaxed),
                         Ok(st) => eprintln!("nocved: heartbeat status {st}"),
                         Err(e) => eprintln!("nocved: heartbeat: {e}"),
                     }
@@ -286,6 +356,7 @@ pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
                 }
                 match shipper.ship_batch(&spool) {
                     ShipOutcome::Sent { .. } => {
+                        last_ship_ok.store(now_ms(), Ordering::Relaxed);
                         backoff = Duration::from_secs(1);
                         continue;
                     }
@@ -328,9 +399,31 @@ pub fn run(cfg: &Config, key: &Token, stop: &AtomicBool) -> Result<(), String> {
                     eprintln!("nocved: sd_notify: {e}");
                 }
             }
+            if done.saturating_sub(last_status) >= STATUS_INTERVAL_MS {
+                last_status = done;
+                let coverage = cov.lock().map(|c| c.clone()).unwrap_or_default();
+                let info = StatusInfo {
+                    state: "running",
+                    started_at_ms,
+                    last_tick_ms: done,
+                    last_heartbeat_ok_ms: last_hb_ok.load(Ordering::Relaxed),
+                    last_ship_ok_ms: last_ship_ok.load(Ordering::Relaxed),
+                    coverage,
+                };
+                write_status(cfg, &sensor, info, done);
+            }
             let wait = (sensor.next_due() - now_ms()).clamp(100, 1000);
             std::thread::sleep(Duration::from_millis(u64::try_from(wait).unwrap_or(1000)));
         }
     });
+    let info = StatusInfo {
+        state: "stopped",
+        started_at_ms,
+        last_tick_ms: last_tick.load(Ordering::Relaxed),
+        last_heartbeat_ok_ms: last_hb_ok.load(Ordering::Relaxed),
+        last_ship_ok_ms: last_ship_ok.load(Ordering::Relaxed),
+        coverage: sensor.coverage(),
+    };
+    write_status(cfg, &sensor, info, now_ms());
     Ok(())
 }

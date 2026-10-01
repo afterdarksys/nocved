@@ -620,7 +620,7 @@ Ansible playbook, key minted on the controller and written with `no_log`.
 ### Alert forwarder to darksignal (P5)
 
 `nocve-store forward --darksignal-socket PATH --cursor FILE [--db PATH]
-[--host NAME]` is a separate process (`deploy/nocve-store-forward.service`),
+[--host NAME] [--status PATH]` is a separate process (`deploy/nocve-store-forward.service`),
 not a thread in `serve`: the HTTP server keeps no darksignal group and no
 Unix-socket client, and the forwarder gets no network at all
 (`PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`).
