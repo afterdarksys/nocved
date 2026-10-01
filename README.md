@@ -14,7 +14,7 @@ Status: MVP, never deployed, nothing committed.
 | Path | What |
 |---|---|
 | `crates/nocve-proto` | event schema, hash chain + HMAC, key tokens, cmdline masking, `data/indicators.json` |
-| `crates/nocved` | sensor: sources (`process`, `net`, `authlog`, `docker`, `packages`, `persistence`), spool, shipper |
+| `crates/nocved` | sensor: sources (`process`, `net`, `authlog`, `docker`, `packages`, `persistence`, `auditd`), spool, shipper |
 | `crates/nocve-store` | store: HTTP API, chain verification, alerts, SQLite, key/admin CLI |
 | `crates/nocve-store/tests/incident_replay.rs` | end-to-end replay of the incident over 127.0.0.1 |
 | `crates/nocve-store/tests/chain_tamper.rs` | modified/dropped/replayed/reordered/wrong-key negatives |

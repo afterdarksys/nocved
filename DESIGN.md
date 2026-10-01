@@ -64,7 +64,8 @@ What it does NOT protect against (read this before trusting it):
   them from nocved too. `aftercve`'s cross-view comparison (section 14) is the
   counter, and it is still bounded by the shared kernel.
 - **Short-lived processes** (< poll interval, default 2 s) are missed by
-  `/proc` polling. auditd/eBPF sources (section 11) close this.
+  `/proc` polling. The auditd execve tail records them when `audit.log` is
+  being written (section 11). An eBPF source remains the later path on 6.1.
 - **Store compromise.** The store holds the derived MAC key for each host
   (section 7). Someone who reads the store DB can forge MACs for that host's
   chain; they still cannot push without the bearer secret, whose preimage the
@@ -139,6 +140,7 @@ every parser is tested from fixtures on any OS.
 | `docker` | 5 s | `/var/run/docker.sock`: `GET /events?since&until` (finite window), `/containers/json`, `/containers/{id}/json` | `container.seen`, `container.create`, `container.start` |
 | `packages` | 5 s | `/var/log/dpkg.log`, `/var/log/apt/history.log` | `package.change`, `package.transaction`, `log.tamper` |
 | `persistence` | 30 s | stat + SHA-256 (never file bytes) of cron, anacrontab, at spools (`/var/spool/at`, `/var/spool/cron/atjobs`), systemd unit dirs including `/etc/systemd/user`, `/var/lib/systemd/linger`, and `{home}/.config/systemd/user`, `ld.so.preload` and `ld.so.conf.d`, `authorized_keys`, sshd, account files, sudoers, PAM, shell init (`profile`, `bash.bashrc`, zsh env/rc, `profile.d`), D-Bus system policy, polkit, udev rules, tmpfiles, modprobe; lstat of shell history. An entry cap, a nested-directory cap, or an unreadable directory is partial coverage. Vendor unit trees and `/run` stay with aftercve's one-shot snapshot. | `persistence.baseline`, `persistence.change`, `history.devnull` |
+| `auditd` | 2 s | `/var/log/audit/audit.log` | `audit.exec`, `log.tamper` |
 
 Sensor meta events: `sensor.start` (version, boot id, coverage), and
 `sensor.events_dropped` (spool overflow count, section 8).
@@ -170,6 +172,8 @@ incident (the rule id is stable, versioned by name):
 | container image is proxyware/miner (`bitping/*`, `traffmonetizer/*`, `xmrig`) | `docker.proxyware_image` / `docker.miner_image` | critical |
 | container inspect says `Privileged` true, or `NetworkMode` is exactly `host` | `docker.privileged` / `docker.host_network` | high |
 | new or changed persistence file | `persist.changed` | medium; high for `ld.so.preload` and `ld.so.conf.d`, `authorized_keys`, sudoers, account files, sshd, PAM, D-Bus system policy, polkit, udev, modprobe |
+| short-lived exec recorded as `audit.exec` (same process rules as a live process) | `proc.miner_cmdline`, `proc.masquerade`, `proc.exe_hidden_dir` | critical / high / medium |
+| audit.log truncated, replaced in place, deleted, or turned into a symlink | `auditlog.truncated`, `auditlog.replaced`, `auditlog.deleted`, `auditlog.symlink` | high |
 
 Negative requirements baked into tests: Playwright's Chromium under
 `/root/.cache/ms-playwright/` (allowlisted) does not get any miner/masquerade
@@ -315,6 +319,8 @@ back. `GET /v1/hosts` computes the silent flag live.
   ships the masked form.
 - Log lines are parsed into fields; raw auth.log lines are not shipped (they can
   contain passwords typed as usernames, a classic).
+- `audit.exec` carries the decoded argv after `mask_argv`. The raw audit line
+  and `PROCTITLE` hex stay on the host.
 
 ## 10. Resource budget
 
@@ -337,6 +343,11 @@ Target < 1 % of one core and < 50 MB RSS on a host with ~500 processes and
   inspect at most 50 containers per poll.
 - persistence: stat every 30 s; SHA-256 only when size/mtime/ctime/inode
   changed, files capped at 1 MiB (larger files report `size_only`).
+- auditd: tails `/var/log/audit/audit.log`, capped at 1 MiB per poll. At most
+  32 audit ids are assembled at once. Only the newest incomplete id is held
+  across polls. A full table is partial coverage. Overflow ids that were not
+  fully assembled are not emitted. A complete group evicted only because the
+  table is full is emitted, and the full table still forces partial coverage.
 - Measurement: `scripts/measure.sh` (run on a test VM, never on prod first)
   samples `/proc/<pid>/stat` utime+stime and `VmRSS` for 10 minutes. On this
   Mac, only the release binary size and the fixture replay were measured
@@ -344,10 +355,11 @@ Target < 1 % of one core and < 50 MB RSS on a host with ~500 processes and
 
 ## 11. Kernel 4.19 vs 6.1: degradation and the eBPF seam
 
-- Debian 10 / 4.19: no reliable eBPF (BTF absent, CO-RE unavailable). The MVP
-  uses only `/proc` polling and log tailing, which work identically on 4.19
-  and 6.1. auditd `execve` records (if auditd is installed) are the next
-  source for short-lived processes; they are file tails like auth.log.
+- Debian 10 / 4.19 has no reliable eBPF (BTF absent, CO-RE unavailable).
+  `/proc` polling, log tailing, and the auditd execve tail work on 4.19 and
+  6.1. Kind `audit.exec` with source `auditd` stays distinct from
+  `process.start`, so aftercve crossview (which matches `process.start` and
+  `process.exit`) keeps tracking processes the sensor still sees.
 - Debian 12 / 6.1: BTF is present, so a later `ebpf` source (exec, connect,
   file-open on persistence paths) can be added behind the same `Source`
   trait. It emits the same event kinds with `source: "ebpf"`, and the process
@@ -450,7 +462,7 @@ Ansible playbook, key minted on the controller and written with `no_log`.
 
 ## 17. Deferred
 
-- eBPF source for 6.1 hosts; auditd `execve` source for 4.19 hosts.
+- eBPF source for 6.1 hosts.
 - journald auth source for rsyslog-less Debian 12 hosts.
 - Forward-secure MAC key ratchet (`k[e+1] = HMAC(k[e], "ratchet")` per hour,
   old keys erased) so a later root compromise cannot forge earlier events.

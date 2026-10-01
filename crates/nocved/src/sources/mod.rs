@@ -1,5 +1,6 @@
-//! Pluggable, bounded event sources. An eBPF source (6.1 hosts) or an auditd
-//! source (4.19 hosts) implements the same trait later (DESIGN.md section 11).
+//! Pluggable, bounded event sources. The auditd source tails `execve` records
+//! on 4.19 and 6.1. An eBPF source (6.1 hosts) implements the same trait later
+//! (DESIGN.md section 11).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use std::time::Duration;
 
 use nocve_proto::{Coverage, CoverageStatus, Event, EventData, Indicators};
 
+pub mod audit;
 pub mod authlog;
 pub mod docker;
 pub mod net;

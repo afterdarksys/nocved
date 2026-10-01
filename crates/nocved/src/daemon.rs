@@ -59,8 +59,14 @@ pub fn build_sources(cfg: &Config) -> Result<Vec<Box<dyn Source>>, String> {
     }
     if s.persistence.enabled {
         v.push(Box::new(sources::persistence::PersistenceSource::new(
-            ctx,
+            ctx.clone(),
             s.persistence.clone(),
+        )));
+    }
+    if s.auditd.enabled {
+        v.push(Box::new(sources::audit::AuditSource::new(
+            ctx,
+            s.auditd.clone(),
         )));
     }
     Ok(v)
@@ -87,6 +93,7 @@ impl Sensor {
             ("docker", s.docker.enabled),
             ("packages", s.packages.enabled),
             ("persistence", s.persistence.enabled),
+            ("auditd", s.auditd.enabled),
         ] {
             if !on {
                 disabled.push(coverage(

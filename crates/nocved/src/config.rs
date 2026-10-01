@@ -152,6 +152,8 @@ pub struct Sources {
     pub packages: SourceToggle,
     #[serde(default)]
     pub persistence: SourceToggle,
+    #[serde(default)]
+    pub auditd: SourceToggle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -317,6 +319,7 @@ mod tests {
         assert!(c.validate().is_ok());
         assert_eq!(c.heartbeat_secs, 30);
         assert!(c.sources.docker.enabled);
+        assert!(c.sources.auditd.enabled);
         assert_eq!(c.sources.process.cpu_threshold_pct, 80);
         assert!(serde_json::from_str::<Config>(r#"{"store_url":"https://x","bogus":1}"#).is_err());
         let c: Config = serde_json::from_str(

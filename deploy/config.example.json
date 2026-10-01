@@ -10,6 +10,7 @@
     "authlog": { "enabled": true, "interval_secs": 2, "paths": ["/var/log/auth.log", "/var/log/secure"], "silence_secs": 1800 },
     "docker": { "enabled": true, "interval_secs": 5, "socket": "/var/run/docker.sock" },
     "packages": { "enabled": true, "interval_secs": 5 },
-    "persistence": { "enabled": true, "interval_secs": 30 }
+    "persistence": { "enabled": true, "interval_secs": 30 },
+    "auditd": { "enabled": true, "interval_secs": 2 }
   }
 }
